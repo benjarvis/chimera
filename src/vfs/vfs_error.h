@@ -28,6 +28,8 @@ enum chimera_vfs_error {
     CHIMERA_VFS_ELOOP        = 40,    /* Too many levels of symbolic links */
     CHIMERA_VFS_EOVERFLOW    = 75,         /* Value too large for defined data type */
     CHIMERA_VFS_EBADF        = 77,     /* Bad file descriptor */
+    CHIMERA_VFS_ENOATTR      = 61,     /* No data available / No attribute */
+    CHIMERA_VFS_E2BIG        = 7,      /* Argument list too long / Value too large */
     CHIMERA_VFS_ENOTSUP      = 95,     /* Operation not supported */
     CHIMERA_VFS_EDQUOT       = 122,    /* Quota exceeded */
     CHIMERA_VFS_ESTALE       = 116,    /* Stale file handle */

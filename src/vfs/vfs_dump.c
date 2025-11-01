@@ -36,6 +36,10 @@ chimera_vfs_op_name(unsigned int opcode)
         case CHIMERA_VFS_OP_SETATTR: return "SetAttr";
         case CHIMERA_VFS_OP_LINK: return "Link";
         case CHIMERA_VFS_OP_CREATE_UNLINKED: return "CreateUnlinked";
+        case CHIMERA_VFS_OP_GETXATTR: return "GetXattr";
+        case CHIMERA_VFS_OP_SETXATTR: return "SetXattr";
+        case CHIMERA_VFS_OP_REMOVEXATTR: return "RemoveXattr";
+        case CHIMERA_VFS_OP_LISTXATTR: return "ListXattr";
         default: return "Unknown";
     } /* switch */
 
@@ -133,6 +137,29 @@ __chimera_vfs_dump_request(struct chimera_vfs_request *req)
                              req->link.namelen,
                              req->link.name);
             break;
+        case CHIMERA_VFS_OP_GETXATTR:
+            chimera_snprintf(argstr, sizeof(argstr),
+                             "hdl %lx attrmask %lx",
+                             req->getxattr.handle->vfs_private,
+                             req->getxattr.r_attr.va_req_mask);
+            break;
+        case CHIMERA_VFS_OP_SETXATTR:
+            chimera_snprintf(argstr, sizeof(argstr),
+                             "hdl %lx value_len %u",
+                             req->setxattr.handle->vfs_private,
+                             req->setxattr.value_length);
+            break;
+        case CHIMERA_VFS_OP_REMOVEXATTR:
+            chimera_snprintf(argstr, sizeof(argstr),
+                             "hdl %lx",
+                             req->removexattr.handle->vfs_private);
+            break;
+        case CHIMERA_VFS_OP_LISTXATTR:
+            chimera_snprintf(argstr, sizeof(argstr),
+                             "hdl %lx cookie %lu",
+                             req->listxattr.handle->vfs_private,
+                             req->listxattr.cookie);
+            break;
         default:
             argstr[0] = '\0';
             break;
@@ -211,6 +238,19 @@ __chimera_vfs_dump_reply(struct chimera_vfs_request *req)
         case CHIMERA_VFS_OP_WRITE:
             chimera_snprintf(argstr, sizeof(argstr), "r_len %u",
                              req->write.r_length);
+            break;
+        case CHIMERA_VFS_OP_GETXATTR:
+            if (req->status == CHIMERA_VFS_OK) {
+                chimera_snprintf(argstr, sizeof(argstr), "r_value_len %u",
+                                 req->getxattr.r_value_length);
+            }
+            break;
+        case CHIMERA_VFS_OP_LISTXATTR:
+            if (req->status == CHIMERA_VFS_OK) {
+                chimera_snprintf(argstr, sizeof(argstr), "r_cookie %lu eof %u",
+                                 req->listxattr.r_cookie,
+                                 req->listxattr.r_eof);
+            }
             break;
         default:
             break;

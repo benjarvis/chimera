@@ -71,6 +71,34 @@ chimera_nfs4_setattr(
     struct nfs_resop4                *resop);
 
 void
+chimera_nfs4_getxattr(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_setxattr(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_listxattrs(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
+chimera_nfs4_removexattr(
+    struct chimera_server_nfs_thread *thread,
+    struct nfs_request               *req,
+    struct nfs_argop4                *argop,
+    struct nfs_resop4                *resop);
+
+void
 chimera_nfs4_lookup(
     struct chimera_server_nfs_thread *thread,
     struct nfs_request               *req,

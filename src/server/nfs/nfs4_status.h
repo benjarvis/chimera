@@ -56,6 +56,10 @@ chimera_nfs4_errno_to_nfsstat4(enum chimera_vfs_error err)
             return NFS4ERR_TOOSMALL;
         case CHIMERA_VFS_EFAULT:
             return NFS4ERR_SERVERFAULT;
+        case CHIMERA_VFS_ENOATTR:
+            return NFS4ERR_NOXATTR;
+        case CHIMERA_VFS_E2BIG:
+            return NFS4ERR_XATTR2BIG;
         default:
             abort();
     } /* switch */

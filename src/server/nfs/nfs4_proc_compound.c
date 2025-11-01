@@ -58,6 +58,18 @@ chimera_nfs4_compound_process(
         case OP_SETATTR:
             chimera_nfs4_setattr(thread, req, argop, resop);
             break;
+        case OP_GETXATTR:
+            chimera_nfs4_getxattr(thread, req, argop, resop);
+            break;
+        case OP_SETXATTR:
+            chimera_nfs4_setxattr(thread, req, argop, resop);
+            break;
+        case OP_LISTXATTRS:
+            chimera_nfs4_listxattrs(thread, req, argop, resop);
+            break;
+        case OP_REMOVEXATTR:
+            chimera_nfs4_removexattr(thread, req, argop, resop);
+            break;
         case OP_CREATE:
             chimera_nfs4_create(thread, req, argop, resop);
             break;

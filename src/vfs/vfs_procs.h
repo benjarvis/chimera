@@ -359,3 +359,71 @@ chimera_vfs_link(
     uint64_t                    post_attr_mask,
     chimera_vfs_link_callback_t callback,
     void                       *private_data);
+
+typedef void (*chimera_vfs_getxattr_callback_t)(
+    enum chimera_vfs_error    error_code,
+    uint32_t                  value_length,
+    struct evpl_iovec        *value_iov,
+    int                       value_niov,
+    struct chimera_vfs_attrs *attr,
+    void                     *private_data);
+
+typedef void (*chimera_vfs_setxattr_callback_t)(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *pre_attr,
+    struct chimera_vfs_attrs *post_attr,
+    void                     *private_data);
+
+typedef void (*chimera_vfs_removexattr_callback_t)(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *pre_attr,
+    struct chimera_vfs_attrs *post_attr,
+    void                     *private_data);
+
+void
+chimera_vfs_getxattr(
+    struct chimera_vfs_thread      *thread,
+    struct chimera_vfs_open_handle *handle,
+    const char                     *key,
+    int                             key_len,
+    struct evpl_iovec              *value_iov,
+    int                             value_niov,
+    uint64_t                        attr_mask,
+    chimera_vfs_getxattr_callback_t callback,
+    void                           *private_data);
+
+void
+chimera_vfs_setxattr(
+    struct chimera_vfs_thread      *thread,
+    struct chimera_vfs_open_handle *handle,
+    const char                     *key,
+    int                             key_len,
+    struct evpl_iovec              *value_iov,
+    int                             value_niov,
+    uint32_t                        value_length,
+    uint32_t                        flags,
+    uint64_t                        pre_attr_mask,
+    uint64_t                        post_attr_mask,
+    chimera_vfs_setxattr_callback_t callback,
+    void                           *private_data);
+
+void
+chimera_vfs_removexattr(
+    struct chimera_vfs_thread      *thread,
+    struct chimera_vfs_open_handle *handle,
+    const char                     *key,
+    int                             key_len,
+    uint64_t                        pre_attr_mask,
+    uint64_t                        post_attr_mask,
+    chimera_vfs_removexattr_callback_t callback,
+    void                           *private_data);
+
+void
+chimera_vfs_listxattr(
+    struct chimera_vfs_thread        *thread,
+    struct chimera_vfs_open_handle   *handle,
+    uint64_t                          attr_mask,
+    uint64_t                          cookie,
+    chimera_vfs_listxattr_callback_t  callback,
+    chimera_vfs_listxattr_complete_t  complete,
+    void                             *private_data);

@@ -66,6 +66,13 @@ struct chimera_vfs_readdir_entry {
     /* Name follows immediately after this struct */
 };
 
+/* Structure for listxattr entries stored in bounce buffer */
+struct chimera_vfs_listxattr_entry {
+    uint64_t cookie;
+    uint32_t key_len;
+    /* Key follows immediately after this struct */
+};
+
 static inline uint64_t
 chimera_vfs_hash(
     const void *data,

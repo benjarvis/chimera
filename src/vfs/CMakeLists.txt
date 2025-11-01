@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: LGPL-2.1-only
 
-add_library(chimera_vfs SHARED vfs.c 
+add_library(chimera_vfs SHARED vfs.c
             vfs_proc_mkdir.c vfs_proc_close.c vfs_proc_open.c
             vfs_proc_readdir.c vfs_proc_getattr.c vfs_proc_lookup.c
             vfs_proc_lookup_path.c vfs_proc_getrootfh.c vfs_proc_read.c
@@ -10,6 +10,8 @@ add_library(chimera_vfs SHARED vfs.c
             vfs_proc_open_at.c vfs_proc_symlink.c vfs_proc_link.c
             vfs_proc_readlink.c vfs_proc_rename.c vfs_proc_setattr.c
             vfs_proc_create_path.c vfs_proc_create_unlinked.c
+            vfs_proc_getxattr.c vfs_proc_setxattr.c
+            vfs_proc_removexattr.c vfs_proc_listxattr.c
             vfs_proc_find.c vfs_dump.c)
 
 target_compile_definitions(chimera_vfs PRIVATE

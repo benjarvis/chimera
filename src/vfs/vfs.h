@@ -124,12 +124,21 @@ struct chimera_vfs_attrs {
 #define CHIMERA_VFS_OP_SETATTR         16
 #define CHIMERA_VFS_OP_LINK            17
 #define CHIMERA_VFS_OP_CREATE_UNLINKED 18
-#define CHIMERA_VFS_OP_NUM             19
+#define CHIMERA_VFS_OP_GETXATTR        19
+#define CHIMERA_VFS_OP_SETXATTR        20
+#define CHIMERA_VFS_OP_REMOVEXATTR     21
+#define CHIMERA_VFS_OP_LISTXATTR       22
+#define CHIMERA_VFS_OP_NUM             23
 
 #define CHIMERA_VFS_OPEN_CREATE        (1U << 0)
 #define CHIMERA_VFS_OPEN_PATH          (1U << 1)
 #define CHIMERA_VFS_OPEN_INFERRED      (1U << 2)
 #define CHIMERA_VFS_OPEN_DIRECTORY     (1U << 3)
+
+/* Flags for setxattr operation */
+#define CHIMERA_VFS_SETXATTR_EITHER    0  /* Create or replace (default) */
+#define CHIMERA_VFS_SETXATTR_CREATE    1  /* Create only, fail if exists */
+#define CHIMERA_VFS_SETXATTR_REPLACE   2  /* Replace only, fail if not exists */
 
 #define CHIMERA_VFS_OPEN_ID_SYNTHETIC  0
 #define CHIMERA_VFS_OPEN_ID_PATH       1
@@ -194,6 +203,20 @@ typedef int (*chimera_vfs_readdir_callback_t)(
     void                           *arg);
 
 typedef void (*chimera_vfs_readdir_complete_t)(
+    enum chimera_vfs_error          error_code,
+    struct chimera_vfs_open_handle *handle,
+    uint64_t                        cookie,
+    uint32_t                        eof,
+    struct chimera_vfs_attrs       *attr,
+    void                           *private_data);
+
+typedef int (*chimera_vfs_listxattr_callback_t)(
+    const char *key,
+    int         key_len,
+    uint64_t    cookie,
+    void       *private_data);
+
+typedef void (*chimera_vfs_listxattr_complete_t)(
     enum chimera_vfs_error          error_code,
     struct chimera_vfs_open_handle *handle,
     uint64_t                        cookie,
@@ -493,6 +516,51 @@ struct chimera_vfs_request {
             struct chimera_vfs_attrs r_dir_pre_attr;
             struct chimera_vfs_attrs r_dir_post_attr;
         } link;
+
+        struct {
+            struct chimera_vfs_open_handle *handle;
+            const char                     *key;
+            int                             key_len;
+            struct evpl_iovec              *value_iov;
+            int                             value_niov;
+            uint32_t                        r_value_length;
+            struct chimera_vfs_attrs        r_attr;
+        } getxattr;
+
+        struct {
+            struct chimera_vfs_open_handle *handle;
+            const char                     *key;
+            int                             key_len;
+            struct evpl_iovec              *value_iov;
+            int                             value_niov;
+            uint32_t                        value_length;
+            uint32_t                        flags;  /* CHIMERA_VFS_SETXATTR_* */
+            struct chimera_vfs_attrs        r_pre_attr;
+            struct chimera_vfs_attrs        r_post_attr;
+        } setxattr;
+
+        struct {
+            struct chimera_vfs_open_handle *handle;
+            const char                     *key;
+            int                             key_len;
+            struct chimera_vfs_attrs        r_pre_attr;
+            struct chimera_vfs_attrs        r_post_attr;
+        } removexattr;
+
+        struct {
+            struct chimera_vfs_open_handle  *handle;
+            uint64_t                         cookie;
+            uint64_t                         attr_mask;
+            uint64_t                         r_cookie;
+            uint32_t                         r_eof;
+            struct chimera_vfs_attrs         r_attr;
+            chimera_vfs_listxattr_callback_t callback;
+
+            struct evpl_iovec                bounce_iov;
+            int                              bounce_offset;
+            chimera_vfs_listxattr_callback_t orig_callback;
+            void                            *orig_private_data;
+        } listxattr;
     };
 };
 
@@ -573,6 +641,13 @@ enum CHIMERA_FS_FH_MAGIC {
  */
 
 #define CHIMERA_VFS_CAP_CREATE_UNLINKED    (1U << 4)
+
+/* If set, module supports extended attributes operations:
+ * chimera_vfs_getxattr(), chimera_vfs_setxattr(),
+ * chimera_vfs_removexattr(), chimera_vfs_listxattr()
+ */
+
+#define CHIMERA_VFS_CAP_XATTR              (1U << 5)
 
 struct chimera_vfs_module {
     /* Required

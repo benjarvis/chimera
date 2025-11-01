@@ -120,6 +120,35 @@ _nfs4_dump_compound(
                                   req, i + 1, args->num_argarray);
                 break;
 
+            case OP_GETXATTR:
+                chimera_nfs_debug("NFS4 Request %p: %02d/%02d GetXattr name=%.*s",
+                                  req, i + 1, args->num_argarray,
+                                  args->argarray[i].opgetxattr.gxa_name.len,
+                                  args->argarray[i].opgetxattr.gxa_name.data);
+                break;
+
+            case OP_SETXATTR:
+                chimera_nfs_debug("NFS4 Request %p: %02d/%02d SetXattr name=%.*s option=%d",
+                                  req, i + 1, args->num_argarray,
+                                  args->argarray[i].opsetxattr.sxa_key.len,
+                                  args->argarray[i].opsetxattr.sxa_key.data,
+                                  args->argarray[i].opsetxattr.sxa_option);
+                break;
+
+            case OP_LISTXATTRS:
+                chimera_nfs_debug("NFS4 Request %p: %02d/%02d ListXattrs cookie=%lu maxcount=%u",
+                                  req, i + 1, args->num_argarray,
+                                  args->argarray[i].oplistxattrs.lxa_cookie,
+                                  args->argarray[i].oplistxattrs.lxa_maxcount);
+                break;
+
+            case OP_REMOVEXATTR:
+                chimera_nfs_debug("NFS4 Request %p: %02d/%02d RemoveXattr name=%.*s",
+                                  req, i + 1, args->num_argarray,
+                                  args->argarray[i].opremovexattr.rxa_name.len,
+                                  args->argarray[i].opremovexattr.rxa_name.data);
+                break;
+
             case OP_GETFH:
                 chimera_nfs_debug("NFS4 Request %p: %02d/%02d GetFH",
                                   req, i + 1, args->num_argarray);

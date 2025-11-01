@@ -32,6 +32,14 @@ struct nfs_nfs4_readdir_cursor {
     struct entry4 *last;
 };
 
+struct nfs_nfs4_listxattrs_cursor {
+    uint32_t       count;         /* Bytes used so far */
+    uint32_t       maxcount;      /* Maximum bytes allowed */
+    uint32_t       num_names;     /* Number of names collected */
+    char          *names;         /* Serialized buffer of length-prefixed keys */
+};
+
+
 struct nfs_request {
     struct chimera_server_nfs_thread *thread;
     struct nfs4_session              *session;
@@ -75,6 +83,7 @@ struct nfs_request {
         struct nfs_nfs3_readdir_cursor     readdir3_cursor;
         struct nfs_nfs3_readdirplus_cursor readdirplus3_cursor;
         struct nfs_nfs4_readdir_cursor     readdir4_cursor;
+        struct nfs_nfs4_listxattrs_cursor  listxattrs4_cursor;
     };
 
 };

@@ -13,6 +13,7 @@
 #include <jansson.h>
 #include <limits.h>
 #include <utlist.h>
+#include <xxhash.h>
 
 
 #include "common/varint.h"
@@ -28,6 +29,7 @@
 #define CAIRN_KEY_DIRENT  1
 #define CAIRN_KEY_SYMLINK 2
 #define CAIRN_KEY_EXTENT  3
+#define CAIRN_KEY_XATTR   4
 
 #define chimera_cairn_debug(...) chimera_debug("cairn", \
                                                __FILE__, \
@@ -76,6 +78,13 @@ struct cairn_extent_key {
     uint8_t  keytype;
     uint64_t inum;
     uint64_t offset;
+} __attribute__((packed));
+
+struct cairn_xattr_key {
+    uint8_t  keytype;
+    uint64_t inum;
+    uint8_t  key_len;
+    char     key[255];
 } __attribute__((packed));
 
 struct cairn_dirent_value {
@@ -2293,6 +2302,338 @@ cairn_link(
 } /* cairn_link */
 
 static void
+cairn_getxattr(
+    struct cairn_thread        *thread,
+    struct cairn_shared        *shared,
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    rocksdb_transaction_t     *txn;
+    struct cairn_xattr_key     xattr_key;
+    struct cairn_inode_handle  ih;
+    struct cairn_inode        *inode;
+    struct evpl_iovec_cursor   cursor;
+    const char                *key;
+    const char                *value;
+    size_t                     value_len;
+    char                      *err = NULL;
+    int                        rc;
+
+    txn = cairn_get_transaction(thread);
+
+    rc = cairn_inode_get_fh(thread, txn, request->fh, request->fh_len, 0, &ih);
+
+    if (rc) {
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
+    inode = ih.inode;
+    key   = request->getxattr.key;
+
+    /* Build xattr key */
+    xattr_key.keytype = CAIRN_KEY_XATTR;
+    xattr_key.inum    = inode->inum;
+    xattr_key.key_len = request->getxattr.key_len;
+    memcpy(xattr_key.key, key, request->getxattr.key_len);
+
+    /* Get xattr value from RocksDB */
+    rocksdb_pinnableslice_t *slice = rocksdb_transaction_get_pinned(
+        txn, shared->read_options,
+        (const char *) &xattr_key,
+        sizeof(xattr_key.keytype) + sizeof(xattr_key.inum) + sizeof(xattr_key.key_len) + xattr_key.key_len,
+        &err);
+
+    chimera_cairn_abort_if(err, "Error getting xattr: %s\n", err);
+
+    if (!slice) {
+        cairn_inode_handle_release(&ih);
+        request->status = CHIMERA_VFS_ENOATTR;
+        request->complete(request);
+        return;
+    }
+
+    value     = rocksdb_pinnableslice_value(slice, &value_len);
+    request->getxattr.r_value_length = value_len;
+
+    /* Copy value to output iovecs if provided */
+    if (request->getxattr.value_iov && request->getxattr.value_niov > 0) {
+        evpl_iovec_cursor_init(&cursor, request->getxattr.value_iov,
+                              request->getxattr.value_niov);
+        evpl_iovec_cursor_copy(&cursor, (void *) value, value_len);
+    }
+
+    cairn_map_attrs(&request->getxattr.r_attr, inode);
+
+    rocksdb_pinnableslice_destroy(slice);
+    cairn_inode_handle_release(&ih);
+
+    request->status = CHIMERA_VFS_OK;
+    DL_APPEND(thread->txn_requests, request);
+} /* cairn_getxattr */
+
+static void
+cairn_setxattr(
+    struct cairn_thread        *thread,
+    struct cairn_shared        *shared,
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    rocksdb_transaction_t     *txn;
+    struct cairn_xattr_key     xattr_key;
+    struct cairn_inode_handle  ih;
+    struct cairn_inode        *inode;
+    struct evpl_iovec_cursor   cursor;
+    const char                *key;
+    char                      *value_buf;
+    size_t                     value_len;
+    char                      *err = NULL;
+    int                        rc;
+
+    txn = cairn_get_transaction(thread);
+
+    rc = cairn_inode_get_fh(thread, txn, request->fh, request->fh_len, 1, &ih);
+
+    if (rc) {
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
+    inode = ih.inode;
+    key   = request->setxattr.key;
+
+    cairn_map_attrs(&request->setxattr.r_pre_attr, inode);
+
+    /* Build xattr key */
+    xattr_key.keytype = CAIRN_KEY_XATTR;
+    xattr_key.inum    = inode->inum;
+    xattr_key.key_len = request->setxattr.key_len;
+    memcpy(xattr_key.key, key, request->setxattr.key_len);
+
+    /* Check if xattr already exists (for CREATE/REPLACE mode) */
+    if (request->setxattr.flags != CHIMERA_VFS_SETXATTR_EITHER) {
+        rocksdb_pinnableslice_t *slice = rocksdb_transaction_get_pinned(
+            txn,
+            shared->read_options,
+            (const char *) &xattr_key,
+            sizeof(xattr_key.keytype) + sizeof(xattr_key.inum) + sizeof(xattr_key.key_len) + xattr_key.key_len,
+            &err);
+
+        chimera_cairn_abort_if(err, "Error checking xattr existence: %s\n", err);
+
+        if (slice) {
+            /* Xattr exists */
+            rocksdb_pinnableslice_destroy(slice);
+            if (request->setxattr.flags == CHIMERA_VFS_SETXATTR_CREATE) {
+                /* CREATE mode - fail if exists */
+                cairn_inode_handle_release(&ih);
+                request->status = CHIMERA_VFS_EEXIST;
+                request->complete(request);
+                return;
+            }
+            /* REPLACE mode - proceed */
+        } else {
+            /* Xattr does not exist */
+            if (request->setxattr.flags == CHIMERA_VFS_SETXATTR_REPLACE) {
+                /* REPLACE mode - fail if not exists */
+                cairn_inode_handle_release(&ih);
+                request->status = CHIMERA_VFS_ENOATTR;
+                request->complete(request);
+                return;
+            }
+            /* CREATE mode - proceed */
+        }
+    }
+
+    /* Extract value from iovecs */
+    value_len = request->setxattr.value_length;
+    value_buf = malloc(value_len);
+    evpl_iovec_cursor_init(&cursor, request->setxattr.value_iov,
+                          request->setxattr.value_niov);
+    evpl_iovec_cursor_copy(&cursor, value_buf, value_len);
+
+    /* Put xattr into RocksDB */
+    rocksdb_transaction_put(txn,
+                           (const char *) &xattr_key,
+                           sizeof(xattr_key.keytype) + sizeof(xattr_key.inum) + sizeof(xattr_key.key_len) + xattr_key.key_len,
+                           value_buf, value_len,
+                           &err);
+
+    chimera_cairn_abort_if(err, "Error setting xattr: %s\n", err);
+
+    free(value_buf);
+
+    cairn_map_attrs(&request->setxattr.r_post_attr, inode);
+
+    cairn_inode_handle_release(&ih);
+
+    request->status = CHIMERA_VFS_OK;
+    DL_APPEND(thread->txn_requests, request);
+} /* cairn_setxattr */
+
+static void
+cairn_removexattr(
+    struct cairn_thread        *thread,
+    struct cairn_shared        *shared,
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    rocksdb_transaction_t     *txn;
+    struct cairn_xattr_key     xattr_key;
+    struct cairn_inode_handle  ih;
+    struct cairn_inode        *inode;
+    const char                *key;
+    char                      *err = NULL;
+    int                        rc;
+
+    txn = cairn_get_transaction(thread);
+
+    rc = cairn_inode_get_fh(thread, txn, request->fh, request->fh_len, 1, &ih);
+
+    if (rc) {
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
+    inode = ih.inode;
+    key   = request->removexattr.key;
+
+    cairn_map_attrs(&request->removexattr.r_pre_attr, inode);
+
+    /* Build xattr key */
+    xattr_key.keytype = CAIRN_KEY_XATTR;
+    xattr_key.inum    = inode->inum;
+    xattr_key.key_len = request->removexattr.key_len;
+    memcpy(xattr_key.key, key, request->removexattr.key_len);
+
+    /* Check if xattr exists */
+    rocksdb_pinnableslice_t *slice = rocksdb_transaction_get_pinned(
+        txn, shared->read_options,
+        (const char *) &xattr_key,
+        sizeof(xattr_key.keytype) + sizeof(xattr_key.inum) + sizeof(xattr_key.key_len) + xattr_key.key_len,
+        &err);
+
+    chimera_cairn_abort_if(err, "Error checking xattr: %s\n", err);
+
+    if (!slice) {
+        cairn_inode_handle_release(&ih);
+        request->status = CHIMERA_VFS_ENOATTR;
+        request->complete(request);
+        return;
+    }
+
+    rocksdb_pinnableslice_destroy(slice);
+
+    /* Delete xattr from RocksDB */
+    rocksdb_transaction_delete(txn,
+                              (const char *) &xattr_key,
+                              sizeof(xattr_key.keytype) + sizeof(xattr_key.inum) + sizeof(xattr_key.key_len) + xattr_key.key_len,
+                              &err);
+
+    chimera_cairn_abort_if(err, "Error removing xattr: %s\n", err);
+
+    cairn_map_attrs(&request->removexattr.r_post_attr, inode);
+
+    cairn_inode_handle_release(&ih);
+
+    request->status = CHIMERA_VFS_OK;
+    DL_APPEND(thread->txn_requests, request);
+} /* cairn_removexattr */
+
+static void
+cairn_listxattr(
+    struct cairn_thread        *thread,
+    struct cairn_shared        *shared,
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    rocksdb_transaction_t      *txn;
+    rocksdb_iterator_t         *iter;
+    struct cairn_xattr_key      start_key, *xattr_key;
+    struct cairn_inode_handle   ih;
+    struct cairn_inode         *inode;
+    uint64_t                    cookie      = request->listxattr.cookie;
+    uint64_t                    next_cookie = 0;
+    uint64_t                    key_hash;
+    size_t                      len;
+    int                         rc, callback_rc, eof = 1;
+    int                         found_start = 0;
+
+    txn = cairn_get_transaction(thread);
+
+    rc = cairn_inode_get_fh(thread, txn, request->fh, request->fh_len, 0, &ih);
+
+    if (rc) {
+        request->status = CHIMERA_VFS_ENOENT;
+        request->complete(request);
+        return;
+    }
+
+    inode = ih.inode;
+
+    /* Setup iterator start key */
+    start_key.keytype = CAIRN_KEY_XATTR;
+    start_key.inum    = inode->inum;
+    start_key.key_len = 0;
+
+    /* Create iterator to scan all xattrs for this inode */
+    iter = rocksdb_transaction_create_iterator(txn, shared->read_options);
+
+    rocksdb_iter_seek(iter, (const char *) &start_key,
+                     sizeof(start_key.keytype) + sizeof(start_key.inum) + sizeof(start_key.key_len));
+
+    /* Iterate through xattrs and call callback for each */
+    while (rocksdb_iter_valid(iter)) {
+        xattr_key = (struct cairn_xattr_key *) rocksdb_iter_key(iter, &len);
+
+        if (xattr_key->keytype != CAIRN_KEY_XATTR || xattr_key->inum != inode->inum) {
+            break;
+        }
+
+        /* Calculate hash cookie for this key */
+        key_hash = XXH64(xattr_key->key, xattr_key->key_len, 0);
+
+        /* Skip entries until we're past the cookie position */
+        if (cookie && !found_start) {
+            if (key_hash <= cookie) {
+                rocksdb_iter_next(iter);
+                continue;
+            }
+            found_start = 1;
+        }
+
+        /* Call the callback with this key and cookie */
+        callback_rc = request->listxattr.callback(
+            (const char *) xattr_key->key,
+            xattr_key->key_len,
+            key_hash,
+            request->proto_private_data);
+
+        if (callback_rc) {
+            /* Callback returned non-zero, stop iteration */
+            eof = 0;
+            break;
+        }
+
+        next_cookie = key_hash;
+        rocksdb_iter_next(iter);
+    }
+
+    rocksdb_iter_destroy(iter);
+
+    cairn_map_attrs(&request->listxattr.r_attr, inode);
+    cairn_inode_handle_release(&ih);
+
+    request->status           = CHIMERA_VFS_OK;
+    request->listxattr.r_cookie = next_cookie;
+    request->listxattr.r_eof    = eof;
+    DL_APPEND(thread->txn_requests, request);
+} /* cairn_listxattr */
+
+static void
 cairn_dispatch(
     struct chimera_vfs_request *request,
     void                       *private_data)
@@ -2353,6 +2694,18 @@ cairn_dispatch(
         case CHIMERA_VFS_OP_LINK:
             cairn_link(thread, shared, request, private_data);
             break;
+        case CHIMERA_VFS_OP_GETXATTR:
+            cairn_getxattr(thread, shared, request, private_data);
+            break;
+        case CHIMERA_VFS_OP_SETXATTR:
+            cairn_setxattr(thread, shared, request, private_data);
+            break;
+        case CHIMERA_VFS_OP_REMOVEXATTR:
+            cairn_removexattr(thread, shared, request, private_data);
+            break;
+        case CHIMERA_VFS_OP_LISTXATTR:
+            cairn_listxattr(thread, shared, request, private_data);
+            break;
         default:
             chimera_cairn_error("cairn_dispatch: unknown operation %d",
                                 request->opcode);
@@ -2365,7 +2718,7 @@ cairn_dispatch(
 SYMBOL_EXPORT struct chimera_vfs_module vfs_cairn = {
     .name           = "cairn",
     .fh_magic       = CHIMERA_VFS_FH_MAGIC_CAIRN,
-    .capabilities   = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_HANDLE_ALL,
+    .capabilities   = CHIMERA_VFS_CAP_BLOCKING | CHIMERA_VFS_CAP_HANDLE_ALL | CHIMERA_VFS_CAP_XATTR,
     .init           = cairn_init,
     .destroy        = cairn_destroy,
     .thread_init    = cairn_thread_init,

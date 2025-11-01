@@ -16,9 +16,11 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/xattr.h>
 #include <liburing.h>
 #include <uthash.h>
 #include <utlist.h>
+#include <xxhash.h>
 
 #include "vfs/vfs_error.h"
 
@@ -28,6 +30,7 @@
 #include "../linux/linux_common.h"
 #include "common/logging.h"
 #include "common/macros.h"
+#include "common/evpl_iovec_cursor.h"
 
 static void
 chimera_io_uring_dispatch(
@@ -1206,6 +1209,275 @@ chimera_io_uring_link(
 } /* chimera_io_uring_link */
 
 static void
+chimera_io_uring_getxattr(
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct chimera_io_uring_thread *thread = private_data;
+    struct evpl_iovec_cursor        cursor;
+    const char                     *key;
+    char                            key_buf[256];
+    char                           *value_buf = NULL;
+    size_t                          key_len;
+    ssize_t                         size;
+    int                             fd;
+
+    --thread->inflight;
+
+    fd      = request->getxattr.handle->vfs_private;
+    key     = request->getxattr.key;
+    key_len = request->getxattr.key_len;
+
+    /* Null-terminate the key for Linux syscall */
+    if (key_len >= sizeof(key_buf)) {
+        request->status = CHIMERA_VFS_ENAMETOOLONG;
+        request->complete(request);
+        return;
+    }
+    memcpy(key_buf, key, key_len);
+    key_buf[key_len] = '\0';
+
+    /* Get xattr size first */
+    size = fgetxattr(fd, key_buf, NULL, 0);
+
+    if (size < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+        request->complete(request);
+        return;
+    }
+
+    request->getxattr.r_value_length = size;
+
+    /* Copy value if buffer provided */
+    if (request->getxattr.value_iov && request->getxattr.value_niov > 0 && size > 0) {
+        value_buf = malloc(size);
+        size = fgetxattr(fd, key_buf, value_buf, size);
+
+        if (size < 0) {
+            free(value_buf);
+            request->status = chimera_linux_errno_to_status(errno);
+            request->complete(request);
+            return;
+        }
+
+        evpl_iovec_cursor_init(&cursor, request->getxattr.value_iov,
+                              request->getxattr.value_niov);
+        evpl_iovec_cursor_copy(&cursor, value_buf, size);
+        free(value_buf);
+    }
+
+    chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
+                            &request->getxattr.r_attr, fd);
+
+    request->status = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* chimera_io_uring_getxattr */
+
+static void
+chimera_io_uring_setxattr(
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct chimera_io_uring_thread *thread = private_data;
+    struct evpl_iovec_cursor        cursor;
+    const char                     *key;
+    char                            key_buf[256];
+    char                           *value_buf;
+    size_t                          key_len, value_len;
+    int                             fd, rc;
+
+    --thread->inflight;
+
+    fd      = request->setxattr.handle->vfs_private;
+    key     = request->setxattr.key;
+    key_len = request->setxattr.key_len;
+
+    /* Null-terminate the key for Linux syscall */
+    if (key_len >= sizeof(key_buf)) {
+        request->status = CHIMERA_VFS_ENAMETOOLONG;
+        request->complete(request);
+        return;
+    }
+    memcpy(key_buf, key, key_len);
+    key_buf[key_len] = '\0';
+
+    /* Extract value from iovecs */
+    value_len = request->setxattr.value_length;
+    value_buf = malloc(value_len);
+    evpl_iovec_cursor_init(&cursor, request->setxattr.value_iov,
+                          request->setxattr.value_niov);
+    evpl_iovec_cursor_copy(&cursor, value_buf, value_len);
+
+    chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
+                            &request->setxattr.r_pre_attr, fd);
+
+    /* Map VFS flags to Linux flags */
+    int linux_flags = 0;
+    if (request->setxattr.flags == CHIMERA_VFS_SETXATTR_CREATE) {
+        linux_flags = XATTR_CREATE;
+    } else if (request->setxattr.flags == CHIMERA_VFS_SETXATTR_REPLACE) {
+        linux_flags = XATTR_REPLACE;
+    }
+
+    rc = fsetxattr(fd, key_buf, value_buf, value_len, linux_flags);
+
+    free(value_buf);
+
+    if (rc < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+        request->complete(request);
+        return;
+    }
+
+    chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
+                            &request->setxattr.r_post_attr, fd);
+
+    request->status = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* chimera_io_uring_setxattr */
+
+static void
+chimera_io_uring_removexattr(
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct chimera_io_uring_thread *thread = private_data;
+    const char                     *key;
+    char                            key_buf[256];
+    size_t                          key_len;
+    int                             fd, rc;
+
+    --thread->inflight;
+
+    fd      = request->removexattr.handle->vfs_private;
+    key     = request->removexattr.key;
+    key_len = request->removexattr.key_len;
+
+    /* Null-terminate the key for Linux syscall */
+    if (key_len >= sizeof(key_buf)) {
+        request->status = CHIMERA_VFS_ENAMETOOLONG;
+        request->complete(request);
+        return;
+    }
+    memcpy(key_buf, key, key_len);
+    key_buf[key_len] = '\0';
+
+    chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
+                            &request->removexattr.r_pre_attr, fd);
+
+    rc = fremovexattr(fd, key_buf);
+
+    if (rc < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+        request->complete(request);
+        return;
+    }
+
+    chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
+                            &request->removexattr.r_post_attr, fd);
+
+    request->status = CHIMERA_VFS_OK;
+    request->complete(request);
+} /* chimera_io_uring_removexattr */
+
+static void
+chimera_io_uring_listxattr(
+    struct chimera_vfs_request *request,
+    void                       *private_data)
+{
+    struct chimera_io_uring_thread *thread = private_data;
+    char                           *all_keys;
+    ssize_t                         size;
+    int                             fd, callback_rc;
+    uint64_t                        cookie      = request->listxattr.cookie;
+    uint64_t                        next_cookie = 0;
+    uint64_t                        key_hash;
+    int                             eof = 1;
+    const char                     *key_ptr;
+    size_t                          key_len;
+    int                             found_start = 0;
+
+    --thread->inflight;
+
+    fd = request->listxattr.handle->vfs_private;
+
+    /* Call flistxattr to get all keys */
+    size = flistxattr(fd, NULL, 0);
+
+    if (size < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+        request->complete(request);
+        return;
+    }
+
+    if (size == 0) {
+        /* No xattrs */
+        chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
+                                &request->listxattr.r_attr, fd);
+        request->status           = CHIMERA_VFS_OK;
+        request->listxattr.r_cookie = 0;
+        request->listxattr.r_eof    = 1;
+        request->complete(request);
+        return;
+    }
+
+    /* Use alloca for temporary buffer - small and never fails */
+    all_keys = alloca(size);
+
+    size = flistxattr(fd, all_keys, size);
+    if (size < 0) {
+        request->status = chimera_linux_errno_to_status(errno);
+        request->complete(request);
+        return;
+    }
+
+    /* Iterate through null-terminated keys and call callback */
+    key_ptr = all_keys;
+    while (key_ptr < all_keys + size) {
+        key_len = strlen(key_ptr);
+        if (key_len == 0) {
+            break;
+        }
+
+        /* Calculate hash cookie for this key */
+        key_hash = XXH64(key_ptr, key_len, 0);
+
+        /* Skip entries until we're past the cookie position */
+        if (cookie && !found_start) {
+            if (key_hash <= cookie) {
+                key_ptr += key_len + 1;
+                continue;
+            }
+            found_start = 1;
+        }
+
+        /* Call the callback with this key and cookie */
+        callback_rc = request->listxattr.callback(
+            key_ptr,
+            key_len,
+            key_hash,
+            request->proto_private_data);
+
+        if (callback_rc) {
+            /* Callback returned non-zero, stop iteration */
+            eof = 0;
+            break;
+        }
+
+        next_cookie = key_hash;
+        key_ptr += key_len + 1;
+    }
+
+    chimera_linux_map_attrs(CHIMERA_VFS_FH_MAGIC_IO_URING,
+                            &request->listxattr.r_attr, fd);
+
+    request->status           = CHIMERA_VFS_OK;
+    request->listxattr.r_cookie = next_cookie;
+    request->listxattr.r_eof    = eof;
+    request->complete(request);
+} /* chimera_io_uring_listxattr */
+
+static void
 chimera_io_uring_dispatch(
     struct chimera_vfs_request *request,
     void                       *private_data)
@@ -1272,6 +1544,18 @@ chimera_io_uring_dispatch(
         case CHIMERA_VFS_OP_SETATTR:
             chimera_io_uring_setattr(request, private_data);
             break;
+        case CHIMERA_VFS_OP_GETXATTR:
+            chimera_io_uring_getxattr(request, private_data);
+            break;
+        case CHIMERA_VFS_OP_SETXATTR:
+            chimera_io_uring_setxattr(request, private_data);
+            break;
+        case CHIMERA_VFS_OP_REMOVEXATTR:
+            chimera_io_uring_removexattr(request, private_data);
+            break;
+        case CHIMERA_VFS_OP_LISTXATTR:
+            chimera_io_uring_listxattr(request, private_data);
+            break;
         default:
             chimera_io_uring_error("io_uring_dispatch: unknown operation %d",
                                    request->opcode);
@@ -1285,7 +1569,7 @@ chimera_io_uring_dispatch(
 SYMBOL_EXPORT struct chimera_vfs_module vfs_io_uring = {
     .name           = "io_uring",
     .fh_magic       = CHIMERA_VFS_FH_MAGIC_IO_URING,
-    .capabilities   = CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED,
+    .capabilities   = CHIMERA_VFS_CAP_OPEN_PATH_REQUIRED | CHIMERA_VFS_CAP_OPEN_FILE_REQUIRED | CHIMERA_VFS_CAP_XATTR,
     .init           = chimera_io_uring_init,
     .destroy        = chimera_io_uring_destroy,
     .thread_init    = chimera_io_uring_thread_init,
