@@ -583,9 +583,9 @@ demofs_init(const char *cfgfile)
     json_error_t                json_error;
 
 
-    cfg = json_load_file(cfgfile, 0, &json_error);
+    cfg = json_loads(cfgfile, 0, &json_error);
 
-    chimera_demofs_abort_if(cfg == NULL, "Error parsing JSON: %s", json_error.text);
+    chimera_demofs_abort_if(cfg == NULL, "Error parsing config: %s", json_error.text);
 
     devices_cfg = json_object_get(cfg, "devices");
 
@@ -2236,9 +2236,9 @@ demofs_write_phase2(
         }
     }
 
-    // Add write data
+    // Add write data - clone to local array (caller retains ownership and releases).
     for (int i = 0; i < request->write.niov; i++) {
-        evpl_iovec_move(&write_iov[write_niov], &request->write.iov[i]);
+        evpl_iovec_clone(&write_iov[write_niov], &request->write.iov[i]);
         write_niov++;
     }
 
