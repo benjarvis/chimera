@@ -67,6 +67,17 @@ check_requirements() {
         log "Install with: apt-get install krb5-kdc krb5-admin-server"
         exit 1
     fi
+
+    # Skip on systems where smbclient is built with MIT Kerberos (RHEL/Rocky/CentOS).
+    # Samba's gensec_gse module fails to resolve ccache credentials on MIT Kerberos
+    # builds, causing NT_STATUS_WRONG_CREDENTIAL_HANDLE during SPNEGO negotiation.
+    # See: https://github.com/chimera-nas/chimera/issues/195
+    local smbclient_path
+    smbclient_path=$(command -v smbclient 2>/dev/null) || true
+    if [ -n "$smbclient_path" ] && ldd "$smbclient_path" 2>/dev/null | grep -q libgssapi_krb5; then
+        log "SKIP: smbclient uses MIT Kerberos (known ccache issue, see GH #195)"
+        exit 77
+    fi
 }
 
 setup_namespace() {

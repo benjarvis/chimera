@@ -28,6 +28,7 @@ add_test(NAME chimera/server/smb/smbclient_kerberos
     COMMAND ${CMAKE_SOURCE_DIR}/scripts/kerberos_test_wrapper.sh
             ${CMAKE_CURRENT_BINARY_DIR}/smbclient_auth_test --mode=kerberos)
 set_tests_properties(chimera/server/smb/smbclient_kerberos PROPERTIES
+    SKIP_RETURN_CODE 77
     ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/suppressions.txt")
 
 find_program(SAMBA_TOOL samba-tool)
