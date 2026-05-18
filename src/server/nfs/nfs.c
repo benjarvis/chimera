@@ -96,6 +96,41 @@ nfs_server_init(
     shared->op_histogram = prometheus_metrics_create_histogram_exponential(metrics, "chimera_nfs_op_latency",
                                                                            "The latency of NFS operations", 24);
 
+    /* NFS4.1 SEQUENCE replay cache metrics.  One counter with an "op"
+     * label distinguishes outcomes; a gauge tracks total bytes held in
+     * the cache across all sessions. */
+    {
+        struct nfs4_replay_metrics *rm = &shared->replay_metrics;
+
+        rm->counter = prometheus_metrics_create_counter(
+            metrics, "chimera_nfs4_replay_cache",
+            "NFS4.1 SEQUENCE replay cache outcomes");
+        rm->hit_series = prometheus_counter_create_series(
+            rm->counter,
+            (const char *[]) { "op" }, (const char *[]) { "hit" }, 1);
+        rm->seq_misordered_series = prometheus_counter_create_series(
+            rm->counter,
+            (const char *[]) { "op" }, (const char *[]) { "seq_misordered" }, 1);
+        rm->bad_slot_series = prometheus_counter_create_series(
+            rm->counter,
+            (const char *[]) { "op" }, (const char *[]) { "bad_slot" }, 1);
+        rm->retry_uncached_series = prometheus_counter_create_series(
+            rm->counter,
+            (const char *[]) { "op" }, (const char *[]) { "retry_uncached" }, 1);
+
+        rm->hit            = prometheus_counter_series_create_instance(rm->hit_series);
+        rm->seq_misordered = prometheus_counter_series_create_instance(rm->seq_misordered_series);
+        rm->bad_slot       = prometheus_counter_series_create_instance(rm->bad_slot_series);
+        rm->retry_uncached = prometheus_counter_series_create_instance(rm->retry_uncached_series);
+
+        rm->bytes_gauge = prometheus_metrics_create_gauge(
+            metrics, "chimera_nfs4_replay_cache_bytes",
+            "Bytes currently held in the NFS4.1 SEQUENCE replay cache");
+        rm->bytes_series = prometheus_gauge_create_series(
+            rm->bytes_gauge, NULL, NULL, 0);
+        rm->bytes_in_use = prometheus_gauge_series_create_instance(rm->bytes_series);
+    }
+
     if (!external_portmap) {
         /* PORTMAP V2 */
         PORTMAP_V2_init(&shared->portmap_v2);
@@ -328,6 +363,49 @@ nfs_server_destroy(void *data)
 
     if (shared->op_histogram) {
         prometheus_histogram_destroy(shared->metrics, shared->op_histogram);
+    }
+
+    {
+        struct nfs4_replay_metrics *rm = &shared->replay_metrics;
+
+        if (rm->bytes_in_use) {
+            prometheus_gauge_series_destroy_instance(rm->bytes_series, rm->bytes_in_use);
+        }
+        if (rm->bytes_series) {
+            prometheus_gauge_destroy_series(rm->bytes_gauge, rm->bytes_series);
+        }
+        if (rm->bytes_gauge) {
+            prometheus_gauge_destroy(shared->metrics, rm->bytes_gauge);
+        }
+
+        if (rm->hit) {
+            prometheus_counter_series_destroy_instance(rm->hit_series, rm->hit);
+        }
+        if (rm->seq_misordered) {
+            prometheus_counter_series_destroy_instance(rm->seq_misordered_series, rm->seq_misordered);
+        }
+        if (rm->bad_slot) {
+            prometheus_counter_series_destroy_instance(rm->bad_slot_series, rm->bad_slot);
+        }
+        if (rm->retry_uncached) {
+            prometheus_counter_series_destroy_instance(rm->retry_uncached_series, rm->retry_uncached);
+        }
+
+        if (rm->hit_series) {
+            prometheus_counter_destroy_series(rm->counter, rm->hit_series);
+        }
+        if (rm->seq_misordered_series) {
+            prometheus_counter_destroy_series(rm->counter, rm->seq_misordered_series);
+        }
+        if (rm->bad_slot_series) {
+            prometheus_counter_destroy_series(rm->counter, rm->bad_slot_series);
+        }
+        if (rm->retry_uncached_series) {
+            prometheus_counter_destroy_series(rm->counter, rm->retry_uncached_series);
+        }
+        if (rm->counter) {
+            prometheus_counter_destroy(shared->metrics, rm->counter);
+        }
     }
     free(shared->mount_v3.rpc2.metrics);
     free(shared->nfs_v3.rpc2.metrics);

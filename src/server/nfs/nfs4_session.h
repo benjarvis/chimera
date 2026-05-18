@@ -14,17 +14,48 @@
 #include "vfs/vfs.h"
 
 struct evpl_rpc2_conn;
+struct nfs_request;
 
-#define NFS4_SESSION_MAX_STATE 1024
+#define NFS4_SESSION_MAX_STATE        1024
 
-#define NFS4_STATE_TYPE_OPEN   0
-#define NFS4_STATE_TYPE_LOCK   1
+#define NFS4_STATE_TYPE_OPEN          0
+#define NFS4_STATE_TYPE_LOCK          1
+
+/* RPC slot table caps (NFS4.1 SEQUENCE replay cache).  These are *server*
+ * ceilings on what a client can negotiate at CREATE_SESSION; the negotiated
+ * value is min(client_request, server_cap). */
+#define NFS4_MAX_REPLY_CACHE_SLOTS    64u
+#define NFS4_MAX_CACHED_RESPONSE_SIZE (64u * 1024u)
+#define NFS4_MAX_REPLY_CACHE_BYTES    (4u * 1024u * 1024u)
+
+enum nfs4_slot_state {
+    NFS4_SLOT_UNUSED      = 0,
+    NFS4_SLOT_IN_PROGRESS = 1,
+    NFS4_SLOT_CACHED      = 2, /* completed; cachethis=true; bytes held */
+    NFS4_SLOT_COMPLETED   = 3, /* completed; cachethis=false; no bytes */
+};
+
+/* Set on req->replay_action by the SEQUENCE handler so the compound
+ * dispatcher knows whether to execute the compound normally or to
+ * short-circuit and replay a cached reply. */
+#define NFS4_REPLAY_ACTION_NONE       0
+#define NFS4_REPLAY_ACTION_NEW        1
+#define NFS4_REPLAY_ACTION_FROM_CACHE 2
+
+struct nfs4_replay_slot {
+    uint32_t seqid;          /* last completed seqid (in CACHED/COMPLETED) */
+    uint32_t inflight_seqid; /* seqid being processed when IN_PROGRESS */
+    uint8_t  state;          /* enum nfs4_slot_state */
+    uint8_t  cachethis;      /* sa_cachethis from current inflight */
+    uint32_t cached_len;     /* bytes in cached_buf (CACHED only) */
+    void    *cached_buf;     /* RPC reply (header+body); malloc'd */
+};
 
 /* Magic stored in nfs4_session.magic so that a connection's private_data
  * (which may hold either an nlm_client* or an nfs4_session*) can be safely
  * type-checked in the disconnect handler.  Must match the layout of
  * nlm_client (uint32_t magic at offset 0). */
-#define NFS4_SESSION_MAGIC     0x4E465353U /* "NFSS" */
+#define NFS4_SESSION_MAGIC 0x4E465353U     /* "NFSS" */
 
 struct nfs4_state {
     struct stateid4                 nfs4_state_id;
@@ -50,22 +81,29 @@ struct nfs4_client {
 
 struct nfs4_session {
     /* magic MUST be the first member -- see NFS4_SESSION_MAGIC comment. */
-    uint32_t              magic;
-    _Atomic uint32_t      refcount;
-    _Atomic bool          destroyed;
-    uint8_t               nfs4_session_id[NFS4_SESSIONID_SIZE];
-    uint64_t              nfs4_session_clientid;
-    pthread_mutex_t       nfs4_session_lock;
-    uint32_t              num_free_slots;
-    struct nfs4_state     nfs4_session_state[NFS4_SESSION_MAX_STATE];
-    uint16_t              free_slot[NFS4_SESSION_MAX_STATE];
-    uint32_t              nfs4_session_implicit;
-    struct nfs4_client   *nfs4_session_client;
-    struct channel_attrs4 nfs4_session_fore_attrs;
-    struct channel_attrs4 nfs4_session_back_attrs;
-    uint32_t              nfs4_session_fore_attrs_rdma_ird;
-    uint32_t              nfs4_session_back_attrs_rdma_ird;
-    struct UT_hash_handle nfs4_session_hh;
+    uint32_t                 magic;
+    _Atomic uint32_t         refcount;
+    _Atomic bool             destroyed;
+    uint8_t                  nfs4_session_id[NFS4_SESSIONID_SIZE];
+    uint64_t                 nfs4_session_clientid;
+    pthread_mutex_t          nfs4_session_lock;
+    uint32_t                 num_free_slots;
+    struct nfs4_state        nfs4_session_state[NFS4_SESSION_MAX_STATE];
+    uint16_t                 free_slot[NFS4_SESSION_MAX_STATE];
+    uint32_t                 nfs4_session_implicit;
+    struct nfs4_client      *nfs4_session_client;
+    struct channel_attrs4    nfs4_session_fore_attrs;
+    struct channel_attrs4    nfs4_session_back_attrs;
+    uint32_t                 nfs4_session_fore_attrs_rdma_ird;
+    uint32_t                 nfs4_session_back_attrs_rdma_ird;
+    /* Replay cache (NFS4.1 SEQUENCE slot table).  Distinct from the
+     * nfs4_session_state[] table above which holds OPEN/LOCK stateid
+     * bookkeeping. */
+    uint32_t                 replay_max_slots;
+    uint32_t                 replay_maxresp_cached;
+    size_t                   replay_bytes_in_use;
+    struct nfs4_replay_slot *replay_slots;
+    struct UT_hash_handle    nfs4_session_hh;
 };
 
 struct nfs4_client_table {
@@ -109,8 +147,34 @@ nfs4_create_session(
     struct nfs4_client_table    *table,
     uint64_t                     client_id,
     uint32_t                     implicit,
+    uint32_t                     replay_max_slots,
+    uint32_t                     replay_maxresp_cached,
     const struct channel_attrs4 *fore_attrs,
     const struct channel_attrs4 *back_attrs);
+
+/* SEQUENCE replay slot state machine.  See plan in
+ * /root/.claude/plans/lets-plan-out-the-steady-steele.md for the full
+ * state diagram.  Returns NFS4_OK on success (NEW request or REPLAY hit),
+ * otherwise an NFS4ERR_* code (BADSLOT / SEQ_MISORDERED / RETRY_UNCACHED_REP).
+ * On NFS4_OK with *out_is_replay=true the caller must short-circuit the
+ * compound and replay slot->cached_buf.
+ *
+ * On NFS4_OK the slot pointer and slot id are stashed on req for the
+ * compound dispatcher to consume at finalize time.  cachethis is recorded
+ * for the in-flight request and consulted only at finalize. */
+nfsstat4 nfs4_replay_slot_acquire(
+    struct nfs4_session *session,
+    uint32_t             slotid,
+    uint32_t             seqid,
+    bool                 cachethis,
+    struct nfs_request  *req,
+    bool                *out_is_replay);
+
+/* Called by the compound dispatcher just before sending the reply.  In
+ * Phase 1 this advances IN_PROGRESS -> COMPLETED.  Phase 2 will optionally
+ * capture the encoded reply bytes and transition to CACHED. */
+void nfs4_replay_slot_finalize(
+    struct nfs_request *req);
 
 struct nfs4_session *
 nfs4_session_lookup(

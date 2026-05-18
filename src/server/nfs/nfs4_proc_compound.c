@@ -3,7 +3,10 @@
 // SPDX-License-Identifier: LGPL-2.1-only
 
 #include "nfs4_procs.h"
+#include "nfs4_session.h"
+#include "evpl/evpl.h"
 #include "evpl/evpl_rpc2.h"
+#include "evpl/evpl_bind.h"
 #include "nfs4_dump.h"
 void
 chimera_nfs4_compound_process(
@@ -15,6 +18,22 @@ chimera_nfs4_compound_process(
     struct nfs_argop4                *argop;
     struct nfs_resop4                *resop;
     int                               rc;
+
+    /* SEQUENCE replay short-circuit: the SEQUENCE op detected a
+     * retransmit on a CACHED slot.  Send the cached reply bytes
+     * verbatim and free the request -- skip compound execution
+     * entirely.  The cached buf is alive because the slot stays
+     * CACHED until the next seqid+1 advances it. */
+    if (req->replay_action == NFS4_REPLAY_ACTION_FROM_CACHE &&
+        req->replay_slot && req->replay_slot->cached_buf) {
+        evpl_send(thread->evpl,
+                  req->conn->bind,
+                  req->replay_slot->cached_buf,
+                  req->replay_slot->cached_len);
+        req->replay_slot = NULL;
+        nfs_request_free(thread, req);
+        return;
+    }
 
  again:
 
@@ -33,6 +52,14 @@ chimera_nfs4_compound_process(
             &req->res_compound,
             req->encoding);
         chimera_nfs_abort_if(rc, "Failed to send RPC2 reply");
+
+        /* Advance the SEQUENCE replay slot to CACHED/COMPLETED.  Must
+         * run *after* send_reply because the reply-capture callback
+         * (armed in nfs4_replay_slot_acquire when sa_cachethis was set)
+         * fires from inside send_reply and writes the captured bytes
+         * onto slot->cached_buf, which finalize then promotes to
+         * CACHED state. */
+        nfs4_replay_slot_finalize(req);
 
         nfs_request_free(thread, req);
         return;

@@ -51,6 +51,13 @@ struct nfs_request {
     struct evpl_rpc2_conn            *conn;
     struct evpl_rpc2_encoding        *encoding;
     struct nlm_lock_entry            *nlm_pending_entry; /* in-flight NLM lock/test */
+    /* NFS4.1 SEQUENCE replay slot tracking.  Set by chimera_nfs4_sequence
+     * when a SEQUENCE op is processed; consumed by the compound dispatcher
+     * at completion time (nfs4_replay_slot_finalize) and on replay
+     * short-circuit. */
+    struct nfs4_replay_slot          *replay_slot;
+    uint32_t                          replay_slot_id;
+    uint8_t                           replay_action;
     struct nfs_request               *next;
     union {
         struct mountargs3       *args_mount;
@@ -96,6 +103,24 @@ struct chimera_nfs_export {
     struct chimera_nfs_export *next;
 };
 
+/* Prometheus instances for the NFS4.1 SEQUENCE replay cache.  All
+ * counters are best-effort (not atomic); contention is low because
+ * SEQUENCE handling is per-session under that session's lock. */
+struct nfs4_replay_metrics {
+    struct prometheus_counter          *counter;
+    struct prometheus_counter_series   *hit_series;
+    struct prometheus_counter_series   *seq_misordered_series;
+    struct prometheus_counter_series   *bad_slot_series;
+    struct prometheus_counter_series   *retry_uncached_series;
+    struct prometheus_counter_instance *hit;
+    struct prometheus_counter_instance *seq_misordered;
+    struct prometheus_counter_instance *bad_slot;
+    struct prometheus_counter_instance *retry_uncached;
+    struct prometheus_gauge            *bytes_gauge;
+    struct prometheus_gauge_series     *bytes_series;
+    struct prometheus_gauge_instance   *bytes_in_use;
+};
+
 struct chimera_server_nfs_shared {
 
     const struct chimera_server_config *config;
@@ -132,6 +157,7 @@ struct chimera_server_nfs_shared {
 
     struct prometheus_histogram        *op_histogram;
     struct prometheus_metrics          *metrics;
+    struct nfs4_replay_metrics          replay_metrics;
 };
 
 struct chimera_server_nfs_thread {
@@ -168,6 +194,10 @@ nfs_request_alloc(
 
     req->conn     = conn;
     req->encoding = encoding;
+
+    req->replay_slot    = NULL;
+    req->replay_slot_id = 0;
+    req->replay_action  = NFS4_REPLAY_ACTION_NONE;
 
     thread->active_requests++;
 
