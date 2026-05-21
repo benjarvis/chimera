@@ -266,10 +266,15 @@ memfs_inode_get_fh(
 
     memfs_fh_to_inum(&inum, &gen, fh, fhlen);
 
-    /* On a data server the file handle carries a metadata-server file identity
-     * that has no local allocation; materialize (or look up) a DS-local inode
-     * keyed by that identity. */
-    if (shared->ds_mode) {
+    /* On a data server, client file handles carry a metadata-server file
+     * identity with no local allocation; materialize (or look up) a DS-local
+     * inode keyed by that identity.  The mount's own root handle is real and
+     * local -- the mount/namespace machinery looks it up -- so it must resolve
+     * normally; otherwise the mount would report a phantom root whose mount_id
+     * differs from the one clients were handed. */
+    if (shared->ds_mode &&
+        !(fhlen == (int) shared->root_fhlen &&
+          memcmp(fh, shared->root_fh, fhlen) == 0)) {
         return memfs_ds_inode_get(shared, inum, gen);
     }
 

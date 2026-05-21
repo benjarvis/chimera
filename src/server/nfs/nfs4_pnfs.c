@@ -3,14 +3,13 @@
 // SPDX-License-Identifier: LGPL-2.1-only
 
 /*
- * NFSv4.1 pNFS (file layout) metadata-server operations.
+ * NFSv4.1 pNFS metadata-server operations, flex-files layout (RFC 8435).
  *
- * v1 hands out whole-file NFSv4.1 file layouts steering each file to a single
- * data server.  The opaque bodies of device_addr4 (GETDEVICEINFO) and
- * layout_content4 (LAYOUTGET) are hand-encoded here rather than via the
- * generated marshallers: the bodies are small and fixed-shape for v1, and the
- * generated representation of the doubly-nested multipath_list4<> typedef is
- * not something we want to depend on.
+ * The MDS hands out whole-file flex-files layouts steering each file to a
+ * single data server, which the client reaches over NFSv3 using the DS's
+ * native file handle.  The opaque bodies of device_addr4 (GETDEVICEINFO ->
+ * ff_device_addr4) and layout_content4 (LAYOUTGET -> ff_layout4) are
+ * hand-encoded here; flex-files XDR is not in the generated nfs4.x.
  */
 
 #include <string.h>
@@ -23,7 +22,8 @@
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_release.h"
 
-#define NFS4_PNFS_STRIPE_UNIT 1048576U   /* 1 MiB; multiple of 64 (NFL util) */
+#define NFS4_PNFS_STRIPE_UNIT 1048576U   /* 1 MiB                              */
+#define LAYOUT4_FLEX_FILES    0x4        /* RFC 8435; not in the generated XDR */
 
 /* --- minimal XDR append helpers (network byte order) --------------------- */
 
@@ -63,31 +63,32 @@ pnfs_put_opaque(
 } /* pnfs_put_opaque */
 
 /*
- * Encode an nfsv4_1_file_layout_ds_addr4 into buf for use as the
- * device_addr4.da_addr_body opaque.  v1: a single stripe mapped to a single
- * multipath list containing one netaddr (the chosen DS).  Returns the number
- * of bytes written.
+ * Encode an ff_device_addr4 (RFC 8435 §5.1) into buf for the
+ * device_addr4.da_addr_body opaque: the data server's network address plus
+ * the NFS version(s) it speaks (NFSv3 here).  Returns bytes written.
  */
 static uint32_t
-chimera_nfs4_encode_ds_addr(
+chimera_nfs4_encode_ff_device_addr(
     uint8_t                     *buf,
     const struct chimera_vfs_ds *ds)
 {
     void *p = buf;
 
-    /* nflda_stripe_indices<> = { 0 } : stripe 0 -> multipath list index 0 */
-    pnfs_put_u32(&p, 1);
-    pnfs_put_u32(&p, 0);
-
-    /* nflda_multipath_ds_list<> : one multipath_list4 ... */
-    pnfs_put_u32(&p, 1);
-    /* ... which is itself a netaddr4<> with one entry */
+    /* ffda_netaddrs: multipath_list4 (a netaddr4<>) with one entry. */
     pnfs_put_u32(&p, 1);
     pnfs_put_opaque(&p, ds->netid, strlen(ds->netid));
     pnfs_put_opaque(&p, ds->uaddr, strlen(ds->uaddr));
 
+    /* ffda_versions<>: one entry advertising NFSv3, loosely coupled. */
+    pnfs_put_u32(&p, 1);
+    pnfs_put_u32(&p, 3);                      /* ffdv_version          */
+    pnfs_put_u32(&p, 0);                      /* ffdv_minorversion     */
+    pnfs_put_u32(&p, NFS4_PNFS_STRIPE_UNIT);  /* ffdv_rsize            */
+    pnfs_put_u32(&p, NFS4_PNFS_STRIPE_UNIT);  /* ffdv_wsize            */
+    pnfs_put_u32(&p, 0);                      /* ffdv_tightly_coupled=false */
+
     return (uint8_t *) p - buf;
-} /* chimera_nfs4_encode_ds_addr */
+} /* chimera_nfs4_encode_ff_device_addr */
 
 void
 chimera_nfs4_getdeviceinfo(
@@ -110,7 +111,7 @@ chimera_nfs4_getdeviceinfo(
         return;
     }
 
-    if (args->gdia_layout_type != LAYOUT4_NFSV4_1_FILES) {
+    if (args->gdia_layout_type != LAYOUT4_FLEX_FILES) {
         res->gdir_status = NFS4ERR_UNKNOWN_LAYOUTTYPE;
         chimera_nfs4_compound_complete(req, res->gdir_status);
         return;
@@ -123,7 +124,7 @@ chimera_nfs4_getdeviceinfo(
         return;
     }
 
-    body_len = chimera_nfs4_encode_ds_addr(body, ds);
+    body_len = chimera_nfs4_encode_ff_device_addr(body, ds);
 
     /* gdia_maxcount bounds the bytes the client will accept for the
      * da_addr_body (RFC 8881 §18.40.3); signal TOOSMALL with the required
@@ -135,7 +136,7 @@ chimera_nfs4_getdeviceinfo(
         return;
     }
 
-    res->gdir_resok4.gdir_device_addr.da_layout_type = LAYOUT4_NFSV4_1_FILES;
+    res->gdir_resok4.gdir_device_addr.da_layout_type = LAYOUT4_FLEX_FILES;
 
     rc = xdr_dbuf_opaque_copy(&res->gdir_resok4.gdir_device_addr.da_addr_body,
                               body,
@@ -156,29 +157,40 @@ chimera_nfs4_getdeviceinfo(
 } /* chimera_nfs4_getdeviceinfo */
 
 /*
- * Encode an nfsv4_1_file_layout4 into buf for the layout_content4.loc_body
- * opaque.  v1: one device, one data-server file handle, whole file.
+ * Encode an ff_layout4 (RFC 8435 §5.1) into buf for the
+ * layout_content4.loc_body opaque: one mirror, one data server holding the
+ * whole file, addressed by its native (NFSv3) file handle.  ffl_flags leaves
+ * NO_LAYOUTCOMMIT clear so the client reports the new size back via
+ * LAYOUTCOMMIT (how the MDS, which doesn't share the DS backend, learns it).
  */
 static uint32_t
-chimera_nfs4_encode_file_layout(
+chimera_nfs4_encode_ff_layout(
     uint8_t                                 *buf,
     const struct chimera_vfs_layout_segment *seg)
 {
-    void *p = buf;
+    void         *p                = buf;
+    const uint8_t zero_stateid[16] = { 0 };
 
-    memcpy(p, seg->deviceid, NFS4_DEVICEID4_SIZE);    /* nfl_deviceid (fixed) */
+    pnfs_put_u64(&p, NFS4_PNFS_STRIPE_UNIT);          /* ffl_stripe_unit       */
+
+    pnfs_put_u32(&p, 1);                              /* ffl_mirrors<> count   */
+    pnfs_put_u32(&p, 1);                              /* ffm_data_servers<>    */
+
+    memcpy(p, seg->deviceid, NFS4_DEVICEID4_SIZE);    /* ffds_deviceid         */
     p += NFS4_DEVICEID4_SIZE;
+    pnfs_put_u32(&p, 0);                              /* ffds_efficiency       */
+    memcpy(p, zero_stateid, sizeof(zero_stateid));    /* ffds_stateid (anon)   */
+    p += sizeof(zero_stateid);
+    pnfs_put_u32(&p, 1);                              /* ffds_fh_vers<> count  */
+    pnfs_put_opaque(&p, seg->ds_fh, seg->ds_fh_len);  /* the DS's v3 handle    */
+    pnfs_put_opaque(&p, "0", 1);                      /* ffds_user  (synthetic)*/
+    pnfs_put_opaque(&p, "0", 1);                      /* ffds_group (synthetic)*/
 
-    /* nfl_util: stripe unit size with COMMIT_THRU_MDS so the client routes
-     * COMMIT/LAYOUTCOMMIT to the MDS (simplest correct path for v1). */
-    pnfs_put_u32(&p, NFS4_PNFS_STRIPE_UNIT | NFL4_UFLG_COMMIT_THRU_MDS);
-    pnfs_put_u32(&p, 0);                              /* nfl_first_stripe_index */
-    pnfs_put_u64(&p, 0);                              /* nfl_pattern_offset     */
-    pnfs_put_u32(&p, 1);                              /* nfl_fh_list count      */
-    pnfs_put_opaque(&p, seg->ds_fh, seg->ds_fh_len);  /* the DS file handle     */
+    pnfs_put_u32(&p, 0);                              /* ffl_flags             */
+    pnfs_put_u32(&p, 0);                              /* ffl_stats_collect_hint*/
 
     return (uint8_t *) p - buf;
-} /* chimera_nfs4_encode_file_layout */
+} /* chimera_nfs4_encode_ff_layout */
 
 static void
 chimera_nfs4_layoutget_complete(
@@ -241,7 +253,7 @@ chimera_nfs4_layoutget_complete(
 
     body = xdr_dbuf_alloc_space(256, req->encoding->dbuf);
     chimera_nfs_abort_if(body == NULL, "Failed to allocate space");
-    body_len = chimera_nfs4_encode_file_layout(body, seg);
+    body_len = chimera_nfs4_encode_ff_layout(body, seg);
 
     lo = xdr_dbuf_alloc_space(sizeof(*lo), req->encoding->dbuf);
     chimera_nfs_abort_if(lo == NULL, "Failed to allocate space");
@@ -249,7 +261,7 @@ chimera_nfs4_layoutget_complete(
     lo->lo_offset           = 0;
     lo->lo_length           = UINT64_MAX;      /* whole file / to EOF */
     lo->lo_iomode           = args->loga_iomode;
-    lo->lo_content.loc_type = LAYOUT4_NFSV4_1_FILES;
+    lo->lo_content.loc_type = LAYOUT4_FLEX_FILES;
 
     int rc = xdr_dbuf_opaque_copy(&lo->lo_content.loc_body, body, body_len,
                                   req->encoding->dbuf);
@@ -306,7 +318,7 @@ chimera_nfs4_layoutget(
         return;
     }
 
-    if (args->loga_layout_type != LAYOUT4_NFSV4_1_FILES) {
+    if (args->loga_layout_type != LAYOUT4_FLEX_FILES) {
         res->logr_status = NFS4ERR_UNKNOWN_LAYOUTTYPE;
         chimera_nfs4_compound_complete(req, res->logr_status);
         return;
@@ -342,7 +354,7 @@ chimera_nfs4_layoutreturn(
         return;
     }
 
-    if (args->lora_layout_type != LAYOUT4_NFSV4_1_FILES) {
+    if (args->lora_layout_type != LAYOUT4_FLEX_FILES) {
         res->lorr_status = NFS4ERR_UNKNOWN_LAYOUTTYPE;
         chimera_nfs4_compound_complete(req, res->lorr_status);
         return;

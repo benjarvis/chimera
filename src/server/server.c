@@ -937,16 +937,23 @@ chimera_server_init(
 
     chimera_server_info("Initializing protocols...");
     server->protocols[server->num_protocols++] = &nfs_protocol;
-    server->protocols[server->num_protocols++] = &smb_protocol;
-    server->protocols[server->num_protocols++] = &s3_protocol;
+
+    /* A pNFS data server speaks only NFS; skipping SMB/S3 also frees their
+     * fixed listen ports so it can share a host with the metadata server. */
+    if (!config->nfs_data_server) {
+        server->protocols[server->num_protocols++] = &smb_protocol;
+        server->protocols[server->num_protocols++] = &s3_protocol;
+    }
 
     for (i = 0; i < server->num_protocols; i++) {
         server->protocol_private[i] = server->protocols[i]->init(config, server->vfs, metrics);
     }
 
-    server->s3_shared  = server->protocol_private[2];
-    server->smb_shared = server->protocol_private[1];
     server->nfs_shared = server->protocol_private[0];
+    if (!config->nfs_data_server) {
+        server->smb_shared = server->protocol_private[1];
+        server->s3_shared  = server->protocol_private[2];
+    }
 
     chimera_server_info("Initializing REST API...");
     server->rest = chimera_rest_init(config, server, server->vfs, metrics);

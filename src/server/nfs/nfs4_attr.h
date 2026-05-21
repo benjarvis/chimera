@@ -584,7 +584,7 @@ chimera_nfs4_marshall_attrs(
             *num_rsp_mask = 2;
 
             chimera_nfs4_attr_append_uint32(&attrs, 1); /* layouttype4<> count */
-            chimera_nfs4_attr_append_uint32(&attrs, LAYOUT4_NFSV4_1_FILES);
+            chimera_nfs4_attr_append_uint32(&attrs, 0x4); /* LAYOUT4_FLEX_FILES (RFC 8435) */
         }
     }
 
@@ -597,7 +597,7 @@ chimera_nfs4_marshall_attrs(
             *num_rsp_mask = 3;
 
             chimera_nfs4_attr_append_uint32(&attrs, 1); /* layouttype4<> count */
-            chimera_nfs4_attr_append_uint32(&attrs, LAYOUT4_NFSV4_1_FILES);
+            chimera_nfs4_attr_append_uint32(&attrs, 0x4); /* LAYOUT4_FLEX_FILES (RFC 8435) */
         }
 
         if (req_mask[2] & (1 << (FATTR4_SUPPATTR_EXCLCREAT - 64))) {
