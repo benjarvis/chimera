@@ -322,7 +322,17 @@ main(
 
     chimera_server_info("Initializing server...");
 
-    metrics = chimera_metrics_init(9000);
+    /* Metrics port (default 9000); configurable so multiple daemons can share
+     * a host (e.g. a pNFS MDS + data server). */
+    int metrics_port = 9000;
+    if (server_params) {
+        json_t *mp = json_object_get(server_params, "metrics_port");
+        if (json_is_integer(mp)) {
+            metrics_port = json_integer_value(mp);
+        }
+    }
+
+    metrics = chimera_metrics_init(metrics_port);
 
     server_config = chimera_server_config_init();
 
@@ -406,6 +416,19 @@ main(
     if (json_is_integer(json_value)) {
         int_value = json_integer_value(json_value);
         chimera_server_config_set_nfs_lockmgr_port(server_config, int_value);
+    }
+
+    json_value = json_object_get(server_params, "nfs_port");
+    if (json_is_integer(json_value)) {
+        int_value = json_integer_value(json_value);
+        chimera_server_config_set_nfs_port(server_config, int_value);
+    }
+
+    /* Data-server mode: bind only the NFSv4 service (no portmap/mount/NLM) so
+     * a pNFS data server can run alongside an MDS on the same host. */
+    json_value = json_object_get(server_params, "data_server");
+    if (json_is_true(json_value)) {
+        chimera_server_config_set_nfs_data_server(server_config, 1);
     }
 
     /* pNFS layout configuration (disabled unless "enabled": true). */

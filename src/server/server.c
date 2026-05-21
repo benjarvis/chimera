@@ -42,6 +42,8 @@ struct chimera_server_config {
     int                                   nfs_rdma_port;
     int                                   nfs_tcp_rdma_port;
     int                                   nfs_lockmgr_port;
+    int                                   nfs_port;
+    int                                   nfs_data_server;
     int                                   external_portmap;
     char                                  portmap_hostname[256];
     int                                   soft_fail_bad_req;
@@ -142,6 +144,11 @@ chimera_server_config_init(void)
     /* pNFS layouts are disabled by default. */
     config->pnfs_enabled = 0;
     config->pnfs_num_ds  = 0;
+
+    /* NFS service port (default 2049); data-server mode binds only the NFSv4
+     * service so a pNFS data server can coexist with an MDS on one host. */
+    config->nfs_port        = 2049;
+    config->nfs_data_server = 0;
 
     config->cache_ttl = 60;
 
@@ -344,6 +351,34 @@ chimera_server_config_add_pnfs_ds(
 
     return idx;
 } /* chimera_server_config_add_pnfs_ds */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs_port(
+    struct chimera_server_config *config,
+    int                           port)
+{
+    config->nfs_port = port;
+} /* chimera_server_config_set_nfs_port */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_nfs_port(const struct chimera_server_config *config)
+{
+    return config->nfs_port;
+} /* chimera_server_config_get_nfs_port */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs_data_server(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->nfs_data_server = enable;
+} /* chimera_server_config_set_nfs_data_server */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_nfs_data_server(const struct chimera_server_config *config)
+{
+    return config->nfs_data_server;
+} /* chimera_server_config_get_nfs_data_server */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_nfs_rdma_hostname(
