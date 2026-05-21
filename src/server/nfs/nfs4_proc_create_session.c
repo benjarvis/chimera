@@ -179,6 +179,15 @@ chimera_nfs4_create_session(
         }
     }
 
+    /* Remember the client's callback program + this connection so we can send
+     * CB_COMPOUND back over the NFSv4.1 backchannel.  Slot-0 sequenceids start
+     * at 1.  (Reconnect/BIND_CONN_TO_SESSION refresh of cb_conn is a follow-up.) */
+    session->nfs4_session_cb_program      = args->csa_cb_program;
+    session->nfs4_session_cb_conn         = conn;
+    session->nfs4_session_cb_seqid        = 1;
+    session->nfs4_session_cb_prog         = shared->nfs_v4_cb.rpc2;
+    session->nfs4_session_cb_prog.program = args->csa_cb_program;
+
     nfs4_session_bind_conn(conn, session);
     req->session = session;
 

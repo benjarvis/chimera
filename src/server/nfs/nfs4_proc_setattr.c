@@ -7,6 +7,8 @@
 #include "nfs4_attr.h"
 #include "nfs4_state.h"
 #include "nfs4_stateid.h"
+#include "nfs4_session.h"
+#include "nfs4_cb.h"
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_release.h"
 
@@ -156,6 +158,15 @@ chimera_nfs4_setattr(
             chimera_nfs4_compound_complete(req, res->status);
             return;
         }
+    }
+
+    /* A size change conflicts with any outstanding writable layout for the
+     * file: recall it so the client flushes its data to the data server and
+     * returns the layout.  No-op if no layout is held. */
+    if (args->obj_attributes.num_attrmask >= 1 &&
+        (args->obj_attributes.attrmask[0] & (1 << FATTR4_SIZE)) &&
+        req->session) {
+        chimera_nfs4_cb_recall_layout(thread, req->session, req->fh, req->fhlen);
     }
 
     chimera_vfs_open_fh(thread->vfs_thread,
