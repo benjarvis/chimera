@@ -2035,23 +2035,11 @@ memfs_open_at(
 
         memfs_apply_attrs(inode, request->open_at.set_attr);
 
-        /* pNFS steering: when this metadata server has data servers configured,
-         * a newly created regular file's data lives on a steered DS.  Mint the
-         * deterministic DS handle now (no control round-trip) and mark the
-         * inode a remote stub; the file arm stays empty. */
-        if (!shared->ds_mode) {
-            const struct chimera_vfs_ds *ds =
-                chimera_vfs_pnfs_steer(request->thread->vfs);
-
-            if (ds) {
-                struct memfs_remote *rem = calloc(1, sizeof(*rem));
-
-                memcpy(rem->deviceid, ds->deviceid, CHIMERA_VFS_DEVICEID_SIZE);
-                rem->ds_fh_len = chimera_vfs_encode_fh_inum_parent(
-                    ds->mount_id, inode->inum, inode->gen, rem->ds_fh);
-                inode->remote = rem;
-            }
-        }
+        /* pNFS flex-files: a regular file's data lives in a backing file the
+         * MDS creates on a data server.  That create is an async RPC to the DS
+         * via the nfs module, so it is done lazily on the first GET_LAYOUT
+         * (memfs_get_layout) rather than synchronously here.  inode->remote
+         * stays NULL until then. */
 
         dirent = memfs_dirent_alloc(thread,
                                     inode->inum,

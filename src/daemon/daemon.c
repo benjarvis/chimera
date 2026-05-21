@@ -445,31 +445,22 @@ main(
             json_t *ds_entry;
             json_array_foreach(data_servers, ds_i, ds_entry)
             {
-                const char *mount_id_str = json_string_value(json_object_get(ds_entry, "mount_id"));
-                const char *netid_str    = json_string_value(json_object_get(ds_entry, "netid"));
-                const char *uaddr_str    = json_string_value(json_object_get(ds_entry, "uaddr"));
-                uint8_t     mount_id[CHIMERA_VFS_MOUNTID_SIZE];
+                const char *netid_str   = json_string_value(json_object_get(ds_entry, "netid"));
+                const char *uaddr_str   = json_string_value(json_object_get(ds_entry, "uaddr"));
+                const char *backing_str = json_string_value(json_object_get(ds_entry, "backing_path"));
 
-                if (!mount_id_str || strlen(mount_id_str) != CHIMERA_VFS_MOUNTID_SIZE * 2 || !uaddr_str) {
+                /* uaddr: the DS network address handed to clients in the
+                 * layout.  backing_path: the chimera path where this DS export
+                 * is mounted via the nfs module, under which the MDS creates
+                 * backing files. */
+                if (!uaddr_str || !backing_str) {
                     chimera_server_error(
-                        "pNFS data_server[%zu] requires a 32-hex-char \"mount_id\" and a \"uaddr\"; skipping",
+                        "pNFS data_server[%zu] requires \"uaddr\" and \"backing_path\"; skipping",
                         ds_i);
                     continue;
                 }
 
-                int ok = 1;
-                for (int b = 0; b < CHIMERA_VFS_MOUNTID_SIZE; b++) {
-                    if (sscanf(mount_id_str + b * 2, "%2hhx", &mount_id[b]) != 1) {
-                        ok = 0;
-                        break;
-                    }
-                }
-                if (!ok) {
-                    chimera_server_error("pNFS data_server[%zu] has a malformed \"mount_id\"; skipping", ds_i);
-                    continue;
-                }
-
-                chimera_server_config_add_pnfs_ds(server_config, mount_id, netid_str, uaddr_str);
+                chimera_server_config_add_pnfs_ds(server_config, netid_str, uaddr_str, backing_str);
             }
         }
     }
@@ -673,6 +664,10 @@ main(
             chimera_server_mount(server, name, module, path, mount_options);
         }
     }
+
+    /* Now that the nfs-module backing mounts exist, resolve each pNFS data
+     * server's backing root so the MDS can create backing files on it. */
+    chimera_server_pnfs_resolve(server);
 
     shares = json_object_get(config, "shares");
 

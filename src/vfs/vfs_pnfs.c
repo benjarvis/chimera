@@ -43,9 +43,9 @@ chimera_vfs_pnfs_enabled(const struct chimera_vfs *vfs)
 SYMBOL_EXPORT int
 chimera_vfs_pnfs_add_device(
     struct chimera_vfs *vfs,
-    const uint8_t      *mount_id,
     const char         *netid,
-    const char         *uaddr)
+    const char         *uaddr,
+    const char         *backing_path)
 {
     struct chimera_vfs_pnfs *pnfs = vfs->pnfs;
     struct chimera_vfs_ds   *ds;
@@ -65,13 +65,32 @@ chimera_vfs_pnfs_add_device(
     ds->deviceid[1]                             = 'S';
     ds->deviceid[CHIMERA_VFS_DEVICEID_SIZE - 1] = (uint8_t) (idx + 1);
 
-    memcpy(ds->mount_id, mount_id, CHIMERA_VFS_MOUNTID_SIZE);
-
     snprintf(ds->netid, sizeof(ds->netid), "%s", netid ? netid : "tcp");
     snprintf(ds->uaddr, sizeof(ds->uaddr), "%s", uaddr ? uaddr : "");
+    snprintf(ds->backing_path, sizeof(ds->backing_path), "%s", backing_path ? backing_path : "");
+
+    ds->root_fh_len = 0;
 
     return idx;
 } /* chimera_vfs_pnfs_add_device */
+
+SYMBOL_EXPORT void
+chimera_vfs_pnfs_set_device_root(
+    struct chimera_vfs *vfs,
+    int                 idx,
+    const void         *root_fh,
+    uint32_t            root_fh_len)
+{
+    struct chimera_vfs_ds *ds;
+
+    if (!vfs->pnfs || idx < 0 || idx >= vfs->pnfs->num_ds) {
+        return;
+    }
+
+    ds              = &vfs->pnfs->ds[idx];
+    ds->root_fh_len = root_fh_len;
+    memcpy(ds->root_fh, root_fh, root_fh_len);
+} /* chimera_vfs_pnfs_set_device_root */
 
 SYMBOL_EXPORT int
 chimera_vfs_pnfs_num_devices(const struct chimera_vfs *vfs)
@@ -79,7 +98,7 @@ chimera_vfs_pnfs_num_devices(const struct chimera_vfs *vfs)
     return vfs->pnfs ? vfs->pnfs->num_ds : 0;
 } /* chimera_vfs_pnfs_num_devices */
 
-SYMBOL_EXPORT const struct chimera_vfs_ds *
+SYMBOL_EXPORT struct chimera_vfs_ds *
 chimera_vfs_pnfs_get_device(
     const struct chimera_vfs *vfs,
     int                       idx)
@@ -88,7 +107,7 @@ chimera_vfs_pnfs_get_device(
         return NULL;
     }
 
-    return &vfs->pnfs->ds[idx];
+    return (struct chimera_vfs_ds *) &vfs->pnfs->ds[idx];
 } /* chimera_vfs_pnfs_get_device */
 
 SYMBOL_EXPORT const struct chimera_vfs_ds *
@@ -111,17 +130,25 @@ chimera_vfs_pnfs_find_device(
     return NULL;
 } /* chimera_vfs_pnfs_find_device */
 
-SYMBOL_EXPORT const struct chimera_vfs_ds *
+SYMBOL_EXPORT struct chimera_vfs_ds *
 chimera_vfs_pnfs_steer(struct chimera_vfs *vfs)
 {
     struct chimera_vfs_pnfs *pnfs = vfs->pnfs;
-    uint32_t                 idx;
+    uint32_t                 i, start;
 
     if (!pnfs || !pnfs->enabled || pnfs->num_ds == 0) {
         return NULL;
     }
 
-    idx = atomic_fetch_add(&pnfs->steer_rr, 1) % pnfs->num_ds;
+    /* Round-robin, but only over data servers whose backing root has been
+     * resolved (mounted).  Skip any that aren't ready yet. */
+    start = atomic_fetch_add(&pnfs->steer_rr, 1);
+    for (i = 0; i < (uint32_t) pnfs->num_ds; i++) {
+        struct chimera_vfs_ds *ds = &pnfs->ds[(start + i) % pnfs->num_ds];
+        if (ds->root_fh_len) {
+            return ds;
+        }
+    }
 
-    return &pnfs->ds[idx];
+    return NULL;
 } /* chimera_vfs_pnfs_steer */

@@ -22,6 +22,7 @@
 #include "vfs/vfs.h"
 #include "vfs/vfs_procs.h"
 #include "vfs/vfs_pnfs.h"
+#include "vfs/vfs_mount_table.h"
 #include "common/macros.h"
 #include "server/server.h"
 #include "smb/smb2.h"
@@ -76,9 +77,9 @@ struct chimera_server_config {
     int                                   pnfs_enabled;
     int                                   pnfs_num_ds;
     struct chimera_server_config_pnfs_ds {
-        uint8_t mount_id[CHIMERA_VFS_MOUNTID_SIZE];
-        char    netid[8];
-        char    uaddr[64];
+        char netid[8];
+        char uaddr[64];
+        char backing_path[CHIMERA_PNFS_BACKING_MAX];
     }                                     pnfs_ds[CHIMERA_PNFS_MAX_DS];
 };
 
@@ -331,9 +332,9 @@ chimera_server_config_get_pnfs_enabled(const struct chimera_server_config *confi
 SYMBOL_EXPORT int
 chimera_server_config_add_pnfs_ds(
     struct chimera_server_config *config,
-    const uint8_t                *mount_id,
     const char                   *netid,
-    const char                   *uaddr)
+    const char                   *uaddr,
+    const char                   *backing_path)
 {
     struct chimera_server_config_pnfs_ds *ds;
     int                                   idx;
@@ -345,9 +346,9 @@ chimera_server_config_add_pnfs_ds(
     idx = config->pnfs_num_ds++;
     ds  = &config->pnfs_ds[idx];
 
-    memcpy(ds->mount_id, mount_id, CHIMERA_VFS_MOUNTID_SIZE);
     snprintf(ds->netid, sizeof(ds->netid), "%s", netid ? netid : "tcp");
     snprintf(ds->uaddr, sizeof(ds->uaddr), "%s", uaddr ? uaddr : "");
+    snprintf(ds->backing_path, sizeof(ds->backing_path), "%s", backing_path ? backing_path : "");
 
     return idx;
 } /* chimera_server_config_add_pnfs_ds */
@@ -800,6 +801,36 @@ chimera_server_mount(
 } /* chimera_server_create_share */
 
 SYMBOL_EXPORT int
+chimera_server_pnfs_resolve(struct chimera_server *server)
+{
+    struct chimera_vfs *vfs = server->vfs;
+    int                 n   = chimera_vfs_pnfs_num_devices(vfs);
+    int                 i, resolved = 0;
+
+    for (i = 0; i < n; i++) {
+        struct chimera_vfs_ds    *ds = chimera_vfs_pnfs_get_device(vfs, i);
+        struct chimera_vfs_mount *m;
+
+        m = chimera_vfs_mount_table_find_by_path(vfs->mount_table,
+                                                 ds->backing_path,
+                                                 strlen(ds->backing_path));
+        if (!m) {
+            chimera_server_error(
+                "pNFS data server %d: backing mount '%s' not found (mount it via the nfs module)",
+                i, ds->backing_path);
+            continue;
+        }
+
+        chimera_vfs_pnfs_set_device_root(vfs, i, m->root_fh, m->root_fh_len);
+        chimera_server_info("pNFS data server %d backing root resolved via '%s'",
+                            i, ds->backing_path);
+        resolved++;
+    }
+
+    return (resolved == n) ? 0 : -1;
+} /* chimera_server_pnfs_resolve */
+
+SYMBOL_EXPORT int
 chimera_server_create_bucket(
     struct chimera_server *server,
     const char            *bucket_name,
@@ -928,9 +959,9 @@ chimera_server_init(
         chimera_vfs_pnfs_set_enabled(server->vfs, 1);
         for (i = 0; i < config->pnfs_num_ds; i++) {
             chimera_vfs_pnfs_add_device(server->vfs,
-                                        config->pnfs_ds[i].mount_id,
                                         config->pnfs_ds[i].netid,
-                                        config->pnfs_ds[i].uaddr);
+                                        config->pnfs_ds[i].uaddr,
+                                        config->pnfs_ds[i].backing_path);
         }
         chimera_server_info("pNFS enabled with %d data server(s)", config->pnfs_num_ds);
     }
