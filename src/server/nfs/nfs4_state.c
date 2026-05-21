@@ -361,6 +361,16 @@ nfs_state_table_release(
                                               memory_order_acquire)) {
             lock_state_cleanup(s, table, vfs_thread);
         }
+    } else if (type == NFS4_SLOT_TYPE_LAYOUT) {
+        struct nfs_layout_state *s = state;
+        prev = atomic_fetch_sub_explicit(&s->refcount, 1,
+                                         memory_order_acq_rel);
+        chimera_nfs_abort_if(prev == 0,
+                             "layout_state refcount underflow on %p", s);
+        if (prev == 1 && atomic_load_explicit(&s->destroyed,
+                                              memory_order_acquire)) {
+            free(s);
+        }
     }
 } /* nfs_state_table_release */
 
@@ -461,6 +471,13 @@ open_state_destroy_locked(
     }
 } /* open_state_destroy_locked */
 
+static void
+layout_state_destroy_locked(
+    struct nfs_client         *client,
+    struct nfs_layout_state   *st,
+    struct nfs_state_table    *table,
+    struct chimera_vfs_thread *vfs_thread);
+
 void
 nfs_client_destroy(
     struct nfs_client         *client,
@@ -505,6 +522,14 @@ nfs_client_destroy(
         HASH_DELETE(hh, client->lock_owners_by_str, lo);
         pthread_mutex_destroy(&lo->lock);
         free(lo);
+    }
+
+    /* pNFS layouts held by the client (NFSv4.1+).  No recall is performed in
+     * v1; the records simply drop with the client's lease. */
+    struct nfs_layout_state *ly, *ly_tmp;
+    HASH_ITER(hh, client->layouts_by_fh, ly, ly_tmp)
+    {
+        layout_state_destroy_locked(client, ly, table, vfs_thread);
     }
 #endif /* ifndef __clang_analyzer__ */
 
@@ -733,6 +758,124 @@ nfs_open_state_destroy(
     open_state_destroy_locked(owner, state, table, vfs_thread);
     pthread_mutex_unlock(&owner->lock);
 } /* nfs_open_state_destroy */
+
+/* --- pNFS layout state ------------------------------------------------- */
+
+struct nfs_layout_state *
+nfs_layout_state_find(
+    struct nfs_client *client,
+    const uint8_t     *fh,
+    uint16_t           fh_len)
+{
+    struct nfs_layout_state *st;
+
+    pthread_mutex_lock(&client->lock);
+    HASH_FIND(hh, client->layouts_by_fh, fh, fh_len, st);
+    pthread_mutex_unlock(&client->lock);
+
+    return st;
+} /* nfs_layout_state_find */
+
+struct nfs_layout_state *
+nfs_layout_state_create(
+    struct nfs_client      *client,
+    const uint8_t          *fh,
+    uint16_t                fh_len,
+    uint32_t                iomode,
+    uint32_t                client_short_id,
+    struct nfs_state_table *table,
+    struct stateid4        *out_stateid)
+{
+    struct nfs_layout_state *st;
+    uint8_t                  shard;
+    uint32_t                 slot_idx, gen;
+    int                      rc;
+
+    chimera_nfs_abort_if(fh_len > NFS4_FHSIZE,
+                         "layout_state_create fh_len %u", fh_len);
+
+    st = calloc(1, sizeof(*st));
+    chimera_nfs_abort_if(st == NULL, "layout_state alloc OOM");
+
+    rc = nfs_state_table_alloc(table, NFS4_SLOT_TYPE_LAYOUT, &shard, &slot_idx, &gen);
+    chimera_nfs_abort_if(rc != 0, "state table exhausted");
+
+    st->client = client;
+    memcpy(st->fh, fh, fh_len);
+    st->fh_len     = fh_len;
+    st->seqid      = 1;
+    st->iomode     = iomode;
+    st->shard      = shard;
+    st->slot_idx   = slot_idx;
+    st->generation = gen;
+    atomic_init(&st->refcount, 1);
+    atomic_init(&st->destroyed, 0);
+
+    nfs_state_table_install(table, shard, slot_idx, NFS4_SLOT_TYPE_LAYOUT, st);
+
+    pthread_mutex_lock(&client->lock);
+    HASH_ADD_KEYPTR(hh, client->layouts_by_fh, st->fh, st->fh_len, st);
+    pthread_mutex_unlock(&client->lock);
+
+    nfs4_stateid_encode(out_stateid, st->seqid, NFS4_STATEID_TYPE_LAYOUT,
+                        shard, slot_idx, gen, client_short_id);
+    return st;
+} /* nfs_layout_state_create */
+
+void
+nfs_layout_state_bump(
+    struct nfs_layout_state *st,
+    uint32_t                 client_short_id,
+    struct stateid4         *out_stateid)
+{
+    /* RFC 8881 §12.5.3: the server owns the layout stateid seqid and advances
+     * it on each successful LAYOUTGET / LAYOUTRETURN. */
+    st->seqid++;
+    nfs4_stateid_encode(out_stateid, st->seqid, NFS4_STATEID_TYPE_LAYOUT,
+                        st->shard, st->slot_idx, st->generation,
+                        client_short_id);
+} /* nfs_layout_state_bump */
+
+static void
+layout_state_destroy_locked(
+    struct nfs_client         *client,
+    struct nfs_layout_state   *st,
+    struct nfs_state_table    *table,
+    struct chimera_vfs_thread *vfs_thread)
+{
+    uint8_t  prev_destroyed;
+    uint32_t prev;
+
+    (void) vfs_thread;
+
+    prev_destroyed = atomic_exchange_explicit(&st->destroyed, 1,
+                                              memory_order_acq_rel);
+    if (prev_destroyed != 0) {
+        return;
+    }
+
+    HASH_DEL(client->layouts_by_fh, st);
+
+    nfs_state_table_free_slot(table, st->shard, st->slot_idx);
+
+    prev = atomic_fetch_sub_explicit(&st->refcount, 1, memory_order_acq_rel);
+    if (prev == 1) {
+        free(st);
+    }
+} /* layout_state_destroy_locked */
+
+void
+nfs_layout_state_destroy(
+    struct nfs_layout_state   *st,
+    struct nfs_state_table    *table,
+    struct chimera_vfs_thread *vfs_thread)
+{
+    struct nfs_client *client = st->client;
+
+    pthread_mutex_lock(&client->lock);
+    layout_state_destroy_locked(client, st, table, vfs_thread);
+    pthread_mutex_unlock(&client->lock);
+} /* nfs_layout_state_destroy */
 
 struct nfs_lock_owner *
 nfs_lock_owner_find_or_create(
