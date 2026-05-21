@@ -161,6 +161,22 @@ chimera_server_config_get_nfs_rdma(
     const struct chimera_server_config *config);
 
 void
+chimera_server_config_set_pnfs_enabled(
+    struct chimera_server_config *config,
+    int                           enable);
+
+int
+chimera_server_config_get_pnfs_enabled(
+    const struct chimera_server_config *config);
+
+int
+chimera_server_config_add_pnfs_ds(
+    struct chimera_server_config *config,
+    const uint8_t                *mount_id,
+    const char                   *netid,
+    const char                   *uaddr);
+
+void
 chimera_server_config_set_nfs_rdma_hostname(
     struct chimera_server_config *config,
     const char                   *hostname);

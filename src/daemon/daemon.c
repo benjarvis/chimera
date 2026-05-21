@@ -18,6 +18,7 @@
 
 #include "server/server.h"
 #include "vfs/vfs_cred.h"
+#include "vfs/vfs_pnfs.h"
 #include "server/server_internal.h"
 #include "common/logging.h"
 #include "metrics/metrics.h"
@@ -405,6 +406,49 @@ main(
     if (json_is_integer(json_value)) {
         int_value = json_integer_value(json_value);
         chimera_server_config_set_nfs_lockmgr_port(server_config, int_value);
+    }
+
+    /* pNFS layout configuration (disabled unless "enabled": true). */
+    json_t *pnfs = json_object_get(server_params, "pnfs");
+    if (pnfs && json_is_object(pnfs)) {
+        json_t *pnfs_enabled = json_object_get(pnfs, "enabled");
+        if (json_is_true(pnfs_enabled)) {
+            chimera_server_config_set_pnfs_enabled(server_config, 1);
+        }
+
+        json_t *data_servers = json_object_get(pnfs, "data_servers");
+        if (json_is_array(data_servers)) {
+            size_t  ds_i;
+            json_t *ds_entry;
+            json_array_foreach(data_servers, ds_i, ds_entry)
+            {
+                const char *mount_id_str = json_string_value(json_object_get(ds_entry, "mount_id"));
+                const char *netid_str    = json_string_value(json_object_get(ds_entry, "netid"));
+                const char *uaddr_str    = json_string_value(json_object_get(ds_entry, "uaddr"));
+                uint8_t     mount_id[CHIMERA_VFS_MOUNTID_SIZE];
+
+                if (!mount_id_str || strlen(mount_id_str) != CHIMERA_VFS_MOUNTID_SIZE * 2 || !uaddr_str) {
+                    chimera_server_error(
+                        "pNFS data_server[%zu] requires a 32-hex-char \"mount_id\" and a \"uaddr\"; skipping",
+                        ds_i);
+                    continue;
+                }
+
+                int ok = 1;
+                for (int b = 0; b < CHIMERA_VFS_MOUNTID_SIZE; b++) {
+                    if (sscanf(mount_id_str + b * 2, "%2hhx", &mount_id[b]) != 1) {
+                        ok = 0;
+                        break;
+                    }
+                }
+                if (!ok) {
+                    chimera_server_error("pNFS data_server[%zu] has a malformed \"mount_id\"; skipping", ds_i);
+                    continue;
+                }
+
+                chimera_server_config_add_pnfs_ds(server_config, mount_id, netid_str, uaddr_str);
+            }
+        }
     }
 
     json_value = json_object_get(server_params, "state_dir");

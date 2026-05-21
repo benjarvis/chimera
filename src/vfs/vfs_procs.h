@@ -447,6 +447,24 @@ chimera_vfs_commit(
     chimera_vfs_commit_callback_t   callback,
     void                           *private_data);
 
+typedef void (*chimera_vfs_get_layout_callback_t)(
+    enum chimera_vfs_error             error_code,
+    uint32_t                           num_segments,
+    struct chimera_vfs_layout_segment *segments,
+    void                              *private_data);
+
+void
+chimera_vfs_get_layout(
+    struct chimera_vfs_thread        *thread,
+    const struct chimera_vfs_cred    *cred,
+    struct chimera_vfs_open_handle   *handle,
+    uint64_t                          offset,
+    uint64_t                          length,
+    uint32_t                          iomode,
+    uint32_t                          layout_type,
+    chimera_vfs_get_layout_callback_t callback,
+    void                             *private_data);
+
 typedef void (*chimera_vfs_symlink_at_callback_t)(
     enum chimera_vfs_error    error_code,
     struct chimera_vfs_attrs *attr,

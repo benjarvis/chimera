@@ -4,6 +4,7 @@
 
 #include "nfs4_procs.h"
 #include "nfs4_recovery.h"
+#include "vfs/vfs_pnfs.h"
 #include "nfs4_session.h"
 #include "nfs4_state.h"
 #include "evpl/evpl_rpc2.h"
@@ -114,7 +115,9 @@ chimera_nfs4_exchange_id(
     res->eir_status                = NFS4_OK;
     res->eir_resok4.eir_clientid   = eid.clientid;
     res->eir_resok4.eir_sequenceid = 1;
-    res->eir_resok4.eir_flags      = EXCHGID4_FLAG_USE_NON_PNFS |
+    res->eir_resok4.eir_flags      =
+        (chimera_vfs_pnfs_enabled(thread->shared->vfs) ?
+         EXCHGID4_FLAG_USE_PNFS_MDS : EXCHGID4_FLAG_USE_NON_PNFS) |
         (eid.confirmed ? EXCHGID4_FLAG_CONFIRMED_R : 0);
     res->eir_resok4.eir_state_protect.spr_how = SP4_NONE;
     res->eir_resok4.num_eir_server_impl_id    = 1;

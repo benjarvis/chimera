@@ -203,7 +203,8 @@ chimera_nfs4_marshall_attrs(
     uint32_t                        max_rsp_mask,
     void                           *attrs,
     uint32_t                       *attrvals_len,
-    uint8_t                         minorversion)
+    uint8_t                         minorversion,
+    int                             pnfs_enabled)
 {
     void    *attrbase = attrs;
     uint64_t v64;
@@ -268,11 +269,13 @@ chimera_nfs4_marshall_attrs(
                                             (1UL << (FATTR4_TIME_METADATA - 32)) |
                                             (1UL << (FATTR4_SPACE_AVAIL - 32)) |
                                             (1UL << (FATTR4_SPACE_FREE - 32)) |
-                                            (1UL << (FATTR4_SPACE_TOTAL - 32)));
+                                            (1UL << (FATTR4_SPACE_TOTAL - 32)) |
+                                            (pnfs_enabled ? (1UL << (FATTR4_FS_LAYOUT_TYPES - 32)) : 0));
 
             if (minorversion >= 1) {
                 chimera_nfs4_attr_append_uint32(&attrs,
-                                                (1 << (FATTR4_SUPPATTR_EXCLCREAT - 64)));
+                                                (1 << (FATTR4_SUPPATTR_EXCLCREAT - 64)) |
+                                                (pnfs_enabled ? (1 << (FATTR4_LAYOUT_TYPES - 64)) : 0));
             }
         }
 
@@ -571,9 +574,32 @@ chimera_nfs4_marshall_attrs(
             chimera_nfs4_attr_append_uint64(&attrs, attr->va_mtime.tv_sec);
             chimera_nfs4_attr_append_uint32(&attrs, attr->va_mtime.tv_nsec);
         }
+
+        /* fs_layout_types is server-static (no backing VFS attribute); emit it
+         * only when pNFS is enabled so it stays consistent with supported_attrs
+         * and EXCHANGE_ID's USE_PNFS_MDS flag. */
+        if (pnfs_enabled &&
+            (req_mask[1] & (1UL << (FATTR4_FS_LAYOUT_TYPES - 32)))) {
+            rsp_mask[1]  |= (1UL << (FATTR4_FS_LAYOUT_TYPES - 32));
+            *num_rsp_mask = 2;
+
+            chimera_nfs4_attr_append_uint32(&attrs, 1); /* layouttype4<> count */
+            chimera_nfs4_attr_append_uint32(&attrs, LAYOUT4_NFSV4_1_FILES);
+        }
     }
 
     if (num_req_mask >= 3) {
+        /* layout_types (attr 64, word2 bit 0) precedes suppattr_exclcreat
+         * (attr 75, word2 bit 11) in ascending bitmap order. */
+        if (pnfs_enabled &&
+            (req_mask[2] & (1 << (FATTR4_LAYOUT_TYPES - 64)))) {
+            rsp_mask[2]  |= (1 << (FATTR4_LAYOUT_TYPES - 64));
+            *num_rsp_mask = 3;
+
+            chimera_nfs4_attr_append_uint32(&attrs, 1); /* layouttype4<> count */
+            chimera_nfs4_attr_append_uint32(&attrs, LAYOUT4_NFSV4_1_FILES);
+        }
+
         if (req_mask[2] & (1 << (FATTR4_SUPPATTR_EXCLCREAT - 64))) {
             rsp_mask[2]  |= (1 << (FATTR4_SUPPATTR_EXCLCREAT - 64));
             *num_rsp_mask = 3;

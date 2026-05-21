@@ -21,6 +21,7 @@
 #include "smb/smb.h"
 #include "vfs/vfs.h"
 #include "vfs/vfs_procs.h"
+#include "vfs/vfs_pnfs.h"
 #include "common/macros.h"
 #include "server/server.h"
 #include "smb/smb2.h"
@@ -70,6 +71,13 @@ struct chimera_server_config {
     struct chimera_vfs_module_cfg         modules[CHIMERA_SERVER_MAX_MODULES];
     struct chimera_server_config_smb_nic  smb_nic_info[16];
     struct chimera_server_config_smb_auth smb_auth;
+    int                                   pnfs_enabled;
+    int                                   pnfs_num_ds;
+    struct chimera_server_config_pnfs_ds {
+        uint8_t mount_id[CHIMERA_VFS_MOUNTID_SIZE];
+        char    netid[8];
+        char    uaddr[64];
+    }                                     pnfs_ds[CHIMERA_PNFS_MAX_DS];
 };
 
 struct chimera_server {
@@ -130,6 +138,10 @@ chimera_server_config_init(void)
 
     config->anonuid = 65534;
     config->anongid = 65534;
+
+    /* pNFS layouts are disabled by default. */
+    config->pnfs_enabled = 0;
+    config->pnfs_num_ds  = 0;
 
     config->cache_ttl = 60;
 
@@ -294,6 +306,44 @@ chimera_server_config_get_nfs_rdma(const struct chimera_server_config *config)
 {
     return config->nfs_rdma;
 } /* chimera_server_config_get_nfs_rdma */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_pnfs_enabled(
+    struct chimera_server_config *config,
+    int                           enable)
+{
+    config->pnfs_enabled = enable;
+} /* chimera_server_config_set_pnfs_enabled */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_pnfs_enabled(const struct chimera_server_config *config)
+{
+    return config->pnfs_enabled;
+} /* chimera_server_config_get_pnfs_enabled */
+
+SYMBOL_EXPORT int
+chimera_server_config_add_pnfs_ds(
+    struct chimera_server_config *config,
+    const uint8_t                *mount_id,
+    const char                   *netid,
+    const char                   *uaddr)
+{
+    struct chimera_server_config_pnfs_ds *ds;
+    int                                   idx;
+
+    if (config->pnfs_num_ds >= CHIMERA_PNFS_MAX_DS) {
+        return -1;
+    }
+
+    idx = config->pnfs_num_ds++;
+    ds  = &config->pnfs_ds[idx];
+
+    memcpy(ds->mount_id, mount_id, CHIMERA_VFS_MOUNTID_SIZE);
+    snprintf(ds->netid, sizeof(ds->netid), "%s", netid ? netid : "tcp");
+    snprintf(ds->uaddr, sizeof(ds->uaddr), "%s", uaddr ? uaddr : "");
+
+    return idx;
+} /* chimera_server_config_add_pnfs_ds */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_nfs_rdma_hostname(
@@ -822,6 +872,20 @@ chimera_server_init(
                                    config->kv_module,
                                    config->cache_ttl,
                                    metrics);
+
+    /* Publish the pNFS data-server table into the VFS layer so both the
+     * backend (steering / layout construction) and the NFS protocol layer
+     * (GETDEVICEINFO) read from a single authoritative table. */
+    if (config->pnfs_enabled && config->pnfs_num_ds > 0) {
+        chimera_vfs_pnfs_set_enabled(server->vfs, 1);
+        for (i = 0; i < config->pnfs_num_ds; i++) {
+            chimera_vfs_pnfs_add_device(server->vfs,
+                                        config->pnfs_ds[i].mount_id,
+                                        config->pnfs_ds[i].netid,
+                                        config->pnfs_ds[i].uaddr);
+        }
+        chimera_server_info("pNFS enabled with %d data server(s)", config->pnfs_num_ds);
+    }
 
     chimera_server_info("Initializing protocols...");
     server->protocols[server->num_protocols++] = &nfs_protocol;
