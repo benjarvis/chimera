@@ -220,6 +220,9 @@ chimera_nfs4_compound_process(
                 case OP_SEEK:
                     chimera_nfs4_seek(thread, req, argop, resop);
                     break;
+                case OP_GETDEVICEINFO:
+                    chimera_nfs4_getdeviceinfo(thread, req, argop, resop);
+                    break;
                 case OP_LOCK:
                     chimera_nfs4_lock(thread, req, argop, resop);
                     break;
