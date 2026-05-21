@@ -5,18 +5,21 @@
 
 # Usage: kvm_pnfs_test_wrapper.sh <vmlinuz> <rootfs.qcow2> <chimera_binary> <backend> <nfsver> <test_cmd>
 #
-# Orchestrates an NFSv4.1 pNFS setup and a QEMU VM to exercise it:
-# 1. Starts a chimera *data server* (memfs in ds_mode) on 10.0.0.1:2050,
-#    binding only the NFS service (data_server mode).
-# 2. Reads the data server's memfs mount_id from its log.
-# 3. Starts a chimera *metadata server* (pNFS enabled, the given backend) on
-#    10.0.0.1:2049, pointing its single data server at 10.0.0.1:2050.
-# 4. Boots a QEMU VM which mounts the MDS with vers=4.1 and runs the test.
+# Orchestrates an NFSv4.1 flex-files pNFS setup and a QEMU VM to exercise it:
+# 1. Starts a chimera *data server* (plain memfs) on 10.0.0.1:2050, exporting a
+#    directory.  data_server mode skips portmap/mountd (so it can share a netns
+#    with the MDS) and serves READ/WRITE statelessly by file handle.
+# 2. Starts a chimera *metadata server* (pNFS enabled) on 10.0.0.1:2049, which
+#    nfs-mounts the data server's export (the control path, over NFSv4 so no
+#    portmap is needed) and steers each file's data to it.
+# 3. Boots a QEMU VM which mounts the MDS with vers=4.1 and runs the test.
 #
-# Because the MDS keeps no data for pNFS-backed files (it returns EIO for any
-# READ/WRITE that does not go through a layout), a workload that successfully
-# reads back what it wrote proves the client used pNFS to reach the data
-# server -- there is no MDS-side fallback that could mask a broken layout.
+# On the first LAYOUTGET the MDS creates a backing file on the data server and
+# hands the client a flex-files layout pointing at the DS's native handle; the
+# client then does NFSv3 READ/WRITE straight to the data server.  memfs FHs are
+# version-independent, so the v4 control path and the v3 data path address the
+# same backing file.  A workload that reads back what it wrote proves the client
+# reached the data server via the layout.
 
 set -u
 
@@ -95,8 +98,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The data server is always memfs in ds_mode: it stores only the file data
-# that pNFS clients write directly, addressed by handles minted by the MDS.
+# The data server is a plain memfs export.  data_server mode skips
+# portmap/mountd (port coexistence with the MDS) and serves READ/WRITE
+# statelessly by file handle, which is exactly what the client's direct pNFS
+# I/O needs.
 generate_ds_config() {
     cat > "$DS_CONFIG" << EOF
 {
@@ -105,23 +110,20 @@ generate_ds_config() {
         "nfs_port": ${DS_PORT},
         "data_server": true,
         "external_portmap": true,
-        "metrics_port": 9001,
-        "vfs": { "memfs": { "config": { "ds_mode": true } } }
+        "metrics_port": 9001
     },
     "mounts": { "ds_data": { "module": "memfs", "path": "/" } },
-    "exports": { "/ds": { "path": "/ds_data" } }
+    "exports": { "/ds_export": { "path": "/ds_data" } }
 }
 EOF
 }
 
-# The metadata server runs the namespace on the requested backend and steers
-# file data to the data server announced via server.pnfs.
+# The metadata server runs the namespace on the requested backend, nfs-mounts
+# the data server's export at /ds0 (control path, over NFSv4 so no portmap is
+# needed), and steers file data to it via server.pnfs (backing_path "/ds0").
 generate_mds_config() {
-    local ds_mount_id="$1"
-    local mount_path="/"
-
     case "$BACKEND" in
-        memfs) mount_path="/" ;;
+        memfs) ;;
         *) echo "pNFS test only supports the memfs backend, got ${BACKEND}" >&2; exit 1 ;;
     esac
 
@@ -133,11 +135,14 @@ generate_mds_config() {
         "pnfs": {
             "enabled": true,
             "data_servers": [
-                { "mount_id": "${ds_mount_id}", "netid": "tcp", "uaddr": "${DS_UADDR}" }
+                { "netid": "tcp", "uaddr": "${DS_UADDR}", "backing_path": "/ds0" }
             ]
         }
     },
-    "mounts": { "share": { "module": "${BACKEND}", "path": "${mount_path}" } },
+    "mounts": {
+        "share": { "module": "${BACKEND}", "path": "/" },
+        "ds0": { "module": "nfs", "path": "${DS_IP}:/ds_export", "options": "vers=4,port=${DS_PORT}" }
+    },
     "exports": { "/share": { "path": "/share" } }
 }
 EOF
@@ -169,25 +174,24 @@ ip netns exec "${NETNS_NAME}" ip tuntap add dev "${TAP_NAME}" mode tap
 ip netns exec "${NETNS_NAME}" ip addr add 10.0.0.1/24 dev "${TAP_NAME}"
 ip netns exec "${NETNS_NAME}" ip link set "${TAP_NAME}" up
 
-# 1. Start the data server and learn its mount_id.
+# 1. Start the data server (must be up before the MDS, which mounts it at boot).
 generate_ds_config
 ip netns exec "${NETNS_NAME}" "$CHIMERA_BINARY" -c "$DS_CONFIG" > "$DS_LOG" 2>&1 &
 DS_PID=$!
 wait_for_port "$DS_IP" "$DS_PORT" "$DS_PID" || exit 1
+echo "=== pNFS data server up on ${DS_IP}:${DS_PORT} ==="
 
-DS_MOUNT_ID=$(grep -oP 'memfs mount_id \K[0-9a-f]{32}' "$DS_LOG" | tail -1)
-if [ -z "$DS_MOUNT_ID" ]; then
-    echo "could not determine data server mount_id" >&2
-    exit 1
-fi
-echo "=== pNFS data server up on ${DS_IP}:${DS_PORT}, mount_id ${DS_MOUNT_ID} ==="
-
-# 2. Start the metadata server pointing at that data server.
-generate_mds_config "$DS_MOUNT_ID"
-ip netns exec "${NETNS_NAME}" "$CHIMERA_BINARY" -c "$MDS_CONFIG" &
+# 2. Start the metadata server; it nfs-mounts the data server at boot.
+generate_mds_config
+ip netns exec "${NETNS_NAME}" "$CHIMERA_BINARY" -c "$MDS_CONFIG" > "${SESSION_DIR}/mds.log" 2>&1 &
 MDS_PID=$!
 wait_for_port "$MDS_IP" "$MDS_PORT" "$MDS_PID" || exit 1
 echo "=== pNFS metadata server up on ${MDS_IP}:${MDS_PORT} ==="
+grep -q "backing root resolved" "${SESSION_DIR}/mds.log" || {
+    echo "MDS did not resolve its data-server backing root:" >&2
+    grep -iE "pNFS|backing|nfs|error" "${SESSION_DIR}/mds.log" | tail -10 >&2
+    exit 1
+}
 
 # 3. Boot the VM, mount the MDS with pNFS, run the workload.
 NFS_MOUNT_OPTS="vers=${NFS_VERSION},tcp"
