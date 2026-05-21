@@ -76,8 +76,7 @@ struct chimera_vfs_mount_options {
 #define CHIMERA_VFS_OP_COPY_RANGE       29
 #define CHIMERA_VFS_OP_CLONE_RANGE      30
 #define CHIMERA_VFS_OP_MOVE_RANGE       31
-#define CHIMERA_VFS_OP_GET_LAYOUT       32
-#define CHIMERA_VFS_OP_NUM              33
+#define CHIMERA_VFS_OP_NUM              32
 
 #define CHIMERA_VFS_OPEN_CREATE         (1U << 0)
 #define CHIMERA_VFS_OPEN_PATH           (1U << 1)
@@ -280,40 +279,15 @@ struct chimera_vfs_find_result {
 };
 
 
-#define CHIMERA_VFS_ACCESS_READ             0x01
-#define CHIMERA_VFS_ACCESS_WRITE            0x02
-#define CHIMERA_VFS_ACCESS_EXECUTE          0x04
+#define CHIMERA_VFS_ACCESS_READ         0x01
+#define CHIMERA_VFS_ACCESS_WRITE        0x02
+#define CHIMERA_VFS_ACCESS_EXECUTE      0x04
 
 struct chimera_vfs_request_handle {
     uint8_t slot;
 };
 
-#define CHIMERA_VFS_REQUEST_MAX_HANDLES     3
-
-/* pNFS layout description returned by CHIMERA_VFS_OP_GET_LAYOUT.
- *
- * A segment maps a byte range of the file to a data server "device" and the
- * opaque file handle to use on that device.  memfs (v1) returns a single
- * whole-file segment, but the array form lets a future extent/block backend
- * describe many stripes/extents without changing the NFS protocol layer.
- */
-#define CHIMERA_VFS_LAYOUT_MAX_SEGMENTS     8
-
-/* iomode values mirror NFSv4.1 LAYOUTIOMODE4 */
-#define CHIMERA_VFS_LAYOUT_IOMODE_READ      1
-#define CHIMERA_VFS_LAYOUT_IOMODE_RW        2
-
-/* layout_type values mirror NFSv4.1 layouttype4 */
-#define CHIMERA_VFS_LAYOUT_TYPE_NFSV4_FILES 1
-
-struct chimera_vfs_layout_segment {
-    uint64_t offset;                       /* first byte of the segment            */
-    uint64_t length;                       /* UINT64_MAX == to end of file         */
-    uint32_t iomode;                       /* CHIMERA_VFS_LAYOUT_IOMODE_*          */
-    uint8_t  deviceid[CHIMERA_VFS_DEVICEID_SIZE];
-    uint32_t ds_fh_len;
-    uint8_t  ds_fh[CHIMERA_VFS_FH_SIZE];   /* opaque DS file handle for this range */
-};
+#define CHIMERA_VFS_REQUEST_MAX_HANDLES 3
 
 struct chimera_vfs_request {
     struct chimera_vfs_thread        *thread;
@@ -814,17 +788,6 @@ struct chimera_vfs_request {
             char     r_name[CHIMERA_VFS_NAME_MAX];
             uint16_t r_name_len;
         } getparent;
-
-        struct {
-            struct chimera_vfs_open_handle   *handle;
-            uint64_t                          offset;
-            uint64_t                          length;
-            uint32_t                          iomode;       /* CHIMERA_VFS_LAYOUT_IOMODE_* */
-            uint32_t                          layout_type;  /* CHIMERA_VFS_LAYOUT_TYPE_*   */
-            uint32_t                          max_segments;
-            uint32_t                          r_num_segments;
-            struct chimera_vfs_layout_segment r_segments[CHIMERA_VFS_LAYOUT_MAX_SEGMENTS];
-        } get_layout;
     };
 };
 
@@ -939,8 +902,8 @@ enum CHIMERA_FS_FH_MAGIC {
  * use (e.g. S3 multipart-upload completion). */
 #define CHIMERA_VFS_CAP_MOVE_RANGE         (1U << 12)
 
-/* Module can answer CHIMERA_VFS_OP_GET_LAYOUT, i.e. it can describe where a
- * file's data physically lives so the NFS server can hand out a pNFS layout. */
+/* Module persists the opaque CHIMERA_VFS_ATTR_PNFS_LAYOUT attribute, so the NFS
+ * server can store per-file pNFS layout state on it and hand out pNFS layouts. */
 #define CHIMERA_VFS_CAP_LAYOUT             (1U << 13)
 
 struct chimera_vfs_module {

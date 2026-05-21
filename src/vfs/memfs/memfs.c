@@ -109,21 +109,13 @@ struct memfs_kv_shard {
     pthread_mutex_t lock;
 };
 
-/* pNFS remote-stub data: when inode->remote is non-NULL the file's data lives
- * on a data server (the file arm is kept empty).  Present only on the MDS. */
+/* Opaque per-file pNFS layout state (CHIMERA_VFS_ATTR_PNFS_LAYOUT).  memfs
+ * persists and returns this blob verbatim via getattr/setattr; only the NFS
+ * server interprets it.  Present (non-NULL) once the NFS server has recorded a
+ * layout for the file. */
 struct memfs_remote {
-    uint8_t  deviceid[CHIMERA_VFS_DEVICEID_SIZE];
-    uint32_t ds_fh_len;
-    uint8_t  ds_fh[CHIMERA_VFS_FH_SIZE];
-};
-
-/* DS-mode: maps a metadata-server file identity (the FH fragment the MDS
- * embeds in a layout) to the data server's locally-allocated inode. */
-struct memfs_ds_inode {
-    uint64_t            ext_inum;
-    uint32_t            ext_gen;
-    struct memfs_inode *inode;
-    UT_hash_handle      hh;
+    uint32_t len;
+    uint8_t  data[CHIMERA_VFS_PNFS_LAYOUT_MAX];
 };
 
 struct memfs_inode {
@@ -184,9 +176,6 @@ struct memfs_shared {
     uint32_t                 block_size;
     uint32_t                 block_shift;
     uint32_t                 block_mask;
-    int                      ds_mode;        /* data-server mode: lazily materialize inodes by FH */
-    struct memfs_ds_inode   *ds_map;         /* ext (inum,gen) -> local inode (ds_mode only) */
-    pthread_mutex_t          ds_map_lock;
     pthread_mutex_t          lock;
 };
 
@@ -249,12 +238,6 @@ memfs_inode_get_inum(
     return inode;
 } /* memfs_inode_get_inum */
 
-static struct memfs_inode *
-memfs_ds_inode_get(
-    struct memfs_shared *shared,
-    uint64_t             inum,
-    uint32_t             gen);
-
 static inline struct memfs_inode *
 memfs_inode_get_fh(
     struct memfs_shared *shared,
@@ -265,18 +248,6 @@ memfs_inode_get_fh(
     uint32_t gen;
 
     memfs_fh_to_inum(&inum, &gen, fh, fhlen);
-
-    /* On a data server, client file handles carry a metadata-server file
-     * identity with no local allocation; materialize (or look up) a DS-local
-     * inode keyed by that identity.  The mount's own root handle is real and
-     * local -- the mount/namespace machinery looks it up -- so it must resolve
-     * normally; otherwise the mount would report a phantom root whose mount_id
-     * differs from the one clients were handed. */
-    if (shared->ds_mode &&
-        !(fhlen == (int) shared->root_fhlen &&
-          memcmp(fh, shared->root_fh, fhlen) == 0)) {
-        return memfs_ds_inode_get(shared, inum, gen);
-    }
 
     return memfs_inode_get_inum(shared, inum, gen);
 } /* memfs_inode_get_fh */
@@ -434,71 +405,6 @@ memfs_inode_alloc_thread(struct memfs_thread *thread)
 
     return memfs_inode_alloc(shared, list_id);
 } /* memfs_inode_alloc */
-
-/*
- * Data-server inode lookup with lazy materialization.
- *
- * The metadata server hands clients a layout whose DS file handle embeds the
- * MDS file identity (inum,gen).  The data server never received a control-plane
- * create, so the first time it sees such a handle it allocates a fresh empty
- * regular inode and remembers the mapping.  Returns the inode locked, matching
- * memfs_inode_get_inum.
- */
-static struct memfs_inode *
-memfs_ds_inode_get(
-    struct memfs_shared *shared,
-    uint64_t             inum,
-    uint32_t             gen)
-{
-    struct memfs_ds_inode *entry;
-    struct memfs_inode    *inode;
-    struct timespec        now;
-
-    pthread_mutex_lock(&shared->ds_map_lock);
-
-    HASH_FIND(hh, shared->ds_map, &inum, sizeof(inum), entry);
-
-    if (entry && entry->ext_gen == gen) {
-        inode = entry->inode;
-        pthread_mutex_unlock(&shared->ds_map_lock);
-        pthread_mutex_lock(&inode->lock);
-        return inode;
-    }
-
-    clock_gettime(CLOCK_REALTIME, &now);
-
-    inode = memfs_inode_alloc(shared, inum & CHIMERA_MEMFS_INODE_LIST_MASK);
-
-    inode->size            = 0;
-    inode->space_used      = 0;
-    inode->uid             = 0;
-    inode->gid             = 0;
-    inode->nlink           = 1;
-    inode->mode            = S_IFREG | 0644;
-    inode->atime           = now;
-    inode->mtime           = now;
-    inode->ctime           = now;
-    inode->file.blocks     = NULL;
-    inode->file.num_blocks = 0;
-    inode->file.max_blocks = 0;
-
-    if (entry) {
-        /* Same MDS inum reused with a new generation (file recreated): rebind. */
-        entry->ext_gen = gen;
-        entry->inode   = inode;
-    } else {
-        entry           = calloc(1, sizeof(*entry));
-        entry->ext_inum = inum;
-        entry->ext_gen  = gen;
-        entry->inode    = inode;
-        HASH_ADD(hh, shared->ds_map, ext_inum, sizeof(inum), entry);
-    }
-
-    pthread_mutex_unlock(&shared->ds_map_lock);
-
-    pthread_mutex_lock(&inode->lock);
-    return inode;
-} /* memfs_ds_inode_get */
 
 static inline void
 memfs_inode_free(
@@ -699,16 +605,8 @@ memfs_init(const char *cfgdata)
             block_size = (uint32_t) v;
         }
 
-        /* Data-server mode: this memfs instance only stores file data that
-         * pNFS clients write directly, addressed by handles minted by a
-         * metadata server. */
-        json_t *dsm = json_object_get(cfg, "ds_mode");
-        if (dsm && json_is_true(dsm)) {
-            shared->ds_mode = 1;
-        }
-
-        /* A stable fsid keeps the mount_id (which the MDS embeds in DS file
-         * handles) constant across restarts.  Accepts a hex or decimal int. */
+        /* A stable fsid keeps the mount_id constant across restarts (useful
+         * for a data server so its handles stay valid).  Hex or decimal int. */
         json_t *fsid_cfg = json_object_get(cfg, "fsid");
         if (fsid_cfg) {
             if (json_is_integer(fsid_cfg)) {
@@ -720,9 +618,6 @@ memfs_init(const char *cfgdata)
 
         json_decref(cfg);
     }
-
-    pthread_mutex_init(&shared->ds_map_lock, NULL);
-    shared->ds_map = NULL;
 
     shared->block_size  = block_size;
     shared->block_mask  = block_size - 1;
@@ -782,18 +677,6 @@ memfs_init(const char *cfgdata)
                                                               shared->root_fh);
     }
 
-    /* The first 16 bytes of any handle in this mount are its mount_id; a pNFS
-     * MDS must be told this value (server.pnfs.data_servers[].mount_id) so it
-     * can mint routable data-server handles. */
-    {
-        const uint8_t *mid = shared->root_fh;
-        chimera_memfs_info(
-            "memfs mount_id %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%s",
-            mid[0], mid[1], mid[2], mid[3], mid[4], mid[5], mid[6], mid[7],
-            mid[8], mid[9], mid[10], mid[11], mid[12], mid[13], mid[14], mid[15],
-            shared->ds_mode ? " (data-server mode)" : "");
-    }
-
     return shared;
 } /* memfs_init */
 
@@ -845,16 +728,6 @@ memfs_destroy(void *private_data)
         }
         free(shared->inode_list[i].inode);
     }
-
-    {
-        struct memfs_ds_inode *ds_entry, *ds_tmp;
-        HASH_ITER(hh, shared->ds_map, ds_entry, ds_tmp)
-        {
-            HASH_DEL(shared->ds_map, ds_entry);
-            free(ds_entry);
-        }
-    }
-    pthread_mutex_destroy(&shared->ds_map_lock);
 
     pthread_mutex_destroy(&shared->lock);
     free(shared->inode_list);
@@ -970,6 +843,13 @@ memfs_map_attrs(
         attr->va_fsid      = shared->fsid;
     }
 
+    /* Opaque pNFS layout state, persisted verbatim for the NFS server. */
+    if ((attr->va_req_mask & CHIMERA_VFS_ATTR_PNFS_LAYOUT) && inode->remote) {
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_PNFS_LAYOUT;
+        attr->va_pnfs_len  = inode->remote->len;
+        memcpy(attr->va_pnfs, inode->remote->data, inode->remote->len);
+    }
+
     if (attr->va_req_mask & CHIMERA_VFS_ATTR_MASK_STATFS) {
         attr->va_set_mask      |= CHIMERA_VFS_ATTR_MASK_STATFS;
         attr->va_fs_space_avail = CHIMERA_VFS_SYNTHETIC_FS_BYTES;
@@ -1036,6 +916,18 @@ memfs_apply_attrs(
         } else {
             inode->mtime = attr->va_mtime;
         }
+    }
+
+    /* Opaque pNFS layout state: persist the NFS server's blob verbatim. */
+    if (set_mask & CHIMERA_VFS_ATTR_PNFS_LAYOUT) {
+        attr->va_set_mask |= CHIMERA_VFS_ATTR_PNFS_LAYOUT;
+        if (!inode->remote) {
+            inode->remote = calloc(1, sizeof(*inode->remote));
+        }
+        inode->remote->len = attr->va_pnfs_len;
+        memcpy(inode->remote->data, attr->va_pnfs,
+               attr->va_pnfs_len <= CHIMERA_VFS_PNFS_LAYOUT_MAX ?
+               attr->va_pnfs_len : CHIMERA_VFS_PNFS_LAYOUT_MAX);
     }
 
     inode->ctime = now;
@@ -2035,12 +1927,6 @@ memfs_open_at(
 
         memfs_apply_attrs(inode, request->open_at.set_attr);
 
-        /* pNFS flex-files: a regular file's data lives in a backing file the
-         * MDS creates on a data server.  That create is an async RPC to the DS
-         * via the nfs module, so it is done lazily on the first GET_LAYOUT
-         * (memfs_get_layout) rather than synchronously here.  inode->remote
-         * stays NULL until then. */
-
         dirent = memfs_dirent_alloc(thread,
                                     inode->inum,
                                     inode->gen,
@@ -2214,15 +2100,6 @@ memfs_read(
 
     }
 
-    /* Data for a pNFS stub lives on a data server; the MDS cannot serve it.
-     * Non-pNFS clients (proxy path deferred) get an I/O error. */
-    if (unlikely(inode->remote)) {
-        pthread_mutex_unlock(&inode->lock);
-        request->status = CHIMERA_VFS_EIO;
-        request->complete(request);
-        return;
-    }
-
     if (unlikely(inode->size <= offset)) {
         memfs_map_attrs(shared, &request->read.r_attr, inode, request->fh);
         pthread_mutex_unlock(&inode->lock);
@@ -2356,15 +2233,6 @@ memfs_write(
             request->complete(request);
             return;
         }
-    }
-
-    /* Data for a pNFS stub lives on a data server; the MDS cannot serve it.
-     * Non-pNFS clients (proxy path deferred) get an I/O error. */
-    if (unlikely(inode->remote)) {
-        pthread_mutex_unlock(&inode->lock);
-        request->status = CHIMERA_VFS_EIO;
-        request->complete(request);
-        return;
     }
 
     memfs_map_attrs(shared, &request->write.r_pre_attr, inode, request->fh);
@@ -4017,55 +3885,6 @@ memfs_search_keys(
 } /* memfs_search_keys */
 
 static void
-memfs_get_layout(
-    struct memfs_thread        *thread,
-    struct memfs_shared        *shared,
-    struct chimera_vfs_request *request,
-    void                       *private_data)
-{
-    struct memfs_inode                *inode;
-    struct chimera_vfs_layout_segment *seg;
-
-    if (request->get_layout.handle->vfs_private) {
-        inode = (struct memfs_inode *) request->get_layout.handle->vfs_private;
-        pthread_mutex_lock(&inode->lock);
-    } else {
-        inode = memfs_inode_get_fh(shared, request->fh, request->fh_len);
-
-        if (unlikely(!inode)) {
-            request->status = CHIMERA_VFS_ENOENT;
-            request->complete(request);
-            return;
-        }
-    }
-
-    /* Only pNFS stubs have a layout; an ordinary file (e.g. created before
-     * pNFS was enabled) has no data server to point the client at. */
-    if (!inode->remote) {
-        pthread_mutex_unlock(&inode->lock);
-        request->status = CHIMERA_VFS_ENOTSUP;
-        request->complete(request);
-        return;
-    }
-
-    seg = &request->get_layout.r_segments[0];
-
-    seg->offset = 0;
-    seg->length = UINT64_MAX;
-    seg->iomode = request->get_layout.iomode;
-    memcpy(seg->deviceid, inode->remote->deviceid, CHIMERA_VFS_DEVICEID_SIZE);
-    seg->ds_fh_len = inode->remote->ds_fh_len;
-    memcpy(seg->ds_fh, inode->remote->ds_fh, inode->remote->ds_fh_len);
-
-    request->get_layout.r_num_segments = 1;
-
-    pthread_mutex_unlock(&inode->lock);
-
-    request->status = CHIMERA_VFS_OK;
-    request->complete(request);
-} /* memfs_get_layout */
-
-static void
 memfs_dispatch(
     struct chimera_vfs_request *request,
     void                       *private_data)
@@ -4136,9 +3955,6 @@ memfs_dispatch(
             break;
         case CHIMERA_VFS_OP_SEEK:
             memfs_seek(thread, shared, request, private_data);
-            break;
-        case CHIMERA_VFS_OP_GET_LAYOUT:
-            memfs_get_layout(thread, shared, request, private_data);
             break;
         case CHIMERA_VFS_OP_SYMLINK_AT:
             memfs_symlink_at(thread, shared, request, private_data);

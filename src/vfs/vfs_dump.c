@@ -43,7 +43,6 @@ chimera_vfs_op_name(unsigned int opcode)
         case CHIMERA_VFS_OP_COPY_RANGE: return "CopyRange";
         case CHIMERA_VFS_OP_CLONE_RANGE: return "CloneRange";
         case CHIMERA_VFS_OP_MOVE_RANGE: return "MoveRange";
-        case CHIMERA_VFS_OP_GET_LAYOUT: return "GetLayout";
         default: return "Unknown";
     } /* switch */
 
