@@ -62,6 +62,7 @@ SESSION_DIR=$(mktemp -d "${BUILD_DIR}/kvm_pnfs_session_XXXXXX")
 MDS_CONFIG="${SESSION_DIR}/mds.json"
 DS_CONFIG="${SESSION_DIR}/ds.json"
 DS_LOG="${SESSION_DIR}/ds.log"
+MDS_LOG="${SESSION_DIR}/mds.log"
 MDS_PID=""
 DS_PID=""
 
@@ -91,6 +92,10 @@ cleanup() {
     if [ -f "$DS_LOG" ]; then
         echo "=== Data server log (tail) ==="
         tail -20 "$DS_LOG"
+    fi
+    if [ -f "$MDS_LOG" ]; then
+        echo "=== Metadata server log (tail) ==="
+        tail -20 "$MDS_LOG"
     fi
     ip netns delete "${NETNS_NAME}" 2>/dev/null || true
     rm -f "$LOG_FILE"
@@ -183,13 +188,13 @@ echo "=== pNFS data server up on ${DS_IP}:${DS_PORT} ==="
 
 # 2. Start the metadata server; it nfs-mounts the data server at boot.
 generate_mds_config
-ip netns exec "${NETNS_NAME}" "$CHIMERA_BINARY" -c "$MDS_CONFIG" > "${SESSION_DIR}/mds.log" 2>&1 &
+ip netns exec "${NETNS_NAME}" "$CHIMERA_BINARY" -c "$MDS_CONFIG" > "$MDS_LOG" 2>&1 &
 MDS_PID=$!
 wait_for_port "$MDS_IP" "$MDS_PORT" "$MDS_PID" || exit 1
 echo "=== pNFS metadata server up on ${MDS_IP}:${MDS_PORT} ==="
-grep -q "backing root resolved" "${SESSION_DIR}/mds.log" || {
+grep -q "backing root resolved" "$MDS_LOG" || {
     echo "MDS did not resolve its data-server backing root:" >&2
-    grep -iE "pNFS|backing|nfs|error" "${SESSION_DIR}/mds.log" | tail -10 >&2
+    grep -iE "pNFS|backing|nfs|error" "$MDS_LOG" | tail -10 >&2
     exit 1
 }
 

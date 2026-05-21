@@ -810,10 +810,18 @@ chimera_server_pnfs_resolve(struct chimera_server *server)
     for (i = 0; i < n; i++) {
         struct chimera_vfs_ds    *ds = chimera_vfs_pnfs_get_device(vfs, i);
         struct chimera_vfs_mount *m;
+        const char               *bpath = ds->backing_path;
+
+        /* Mounts are registered with leading slashes stripped (see
+         * chimera_vfs_mount), so normalize the configured backing path the same
+         * way -- otherwise "/ds0" only prefix-matches the empty-path root. */
+        while (*bpath == '/') {
+            bpath++;
+        }
 
         m = chimera_vfs_mount_table_find_by_path(vfs->mount_table,
-                                                 ds->backing_path,
-                                                 strlen(ds->backing_path));
+                                                 bpath,
+                                                 strlen(bpath));
         if (!m) {
             chimera_server_error(
                 "pNFS data server %d: backing mount '%s' not found (mount it via the nfs module)",
@@ -822,8 +830,10 @@ chimera_server_pnfs_resolve(struct chimera_server *server)
         }
 
         chimera_vfs_pnfs_set_device_root(vfs, i, m->root_fh, m->root_fh_len);
-        chimera_server_info("pNFS data server %d backing root resolved via '%s'",
-                            i, ds->backing_path);
+        chimera_server_info("pNFS data server %d backing root resolved via '%s' (module=%s path=%s root_fh_len=%d)",
+                            i, ds->backing_path,
+                            m->module ? m->module->name : "?",
+                            m->path ? m->path : "?", m->root_fh_len);
         resolved++;
     }
 
