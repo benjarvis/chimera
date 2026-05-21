@@ -470,9 +470,23 @@ chimera_server_config_add_module(
     const char                   *module_path,
     const char                   *config_data)
 {
-    struct chimera_vfs_module_cfg *module_cfg;
+    struct chimera_vfs_module_cfg *module_cfg = NULL;
+    int                            i;
 
-    module_cfg = &config->modules[config->num_modules];
+    /* A module name maps to a single backend (one fh_magic), so configuring a
+     * built-in module (e.g. memfs with ds_mode/block_size) must override its
+     * default entry rather than register a duplicate -- a double registration
+     * leaks the first instance's private state. */
+    for (i = 0; i < config->num_modules; i++) {
+        if (strcmp(config->modules[i].module_name, module_name) == 0) {
+            module_cfg = &config->modules[i];
+            break;
+        }
+    }
+
+    if (!module_cfg) {
+        module_cfg = &config->modules[config->num_modules++];
+    }
 
     strncpy(module_cfg->module_name, module_name, sizeof(module_cfg->module_name));
     strncpy(module_cfg->config_data, config_data, sizeof(module_cfg->config_data));
@@ -482,8 +496,7 @@ chimera_server_config_add_module(
         /* We don't specify a path for preloaded modules like demofs */
         module_cfg->module_path[0] = '\0';
     }
-    config->num_modules++;
-} /* chimera_server_config_add_module */ /* chimera_server_config_add_module */
+} /* chimera_server_config_add_module */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_metrics_port(
