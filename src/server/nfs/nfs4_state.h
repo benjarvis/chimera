@@ -277,21 +277,36 @@ struct nfs_lock_state {
  * layout per file and does not implement recall, so the record exists mainly
  * to mint and validate the layout stateid and to be torn down with the client.
  */
+/* A conflicting operation (e.g. truncate) deferred until the client returns a
+ * recalled layout.  resume(arg) runs once the layout is returned (LAYOUTRETURN)
+ * or the client confirms it no longer holds it. */
+struct nfs4_recall_waiter {
+    void                       (*resume)(
+        void *arg);
+    void                      *arg;
+    struct nfs4_recall_waiter *next;
+};
+
 struct nfs_layout_state {
-    struct nfs_client *client;          /* borrowed; client outlives the layout */
-    uint8_t            fh[NFS4_FHSIZE];
-    uint16_t           fh_len;
-    uint32_t           seqid;           /* server-incremented layout stateid seqid */
-    uint32_t           iomode;          /* current LAYOUTIOMODE4 */
+    struct nfs_client         *client;  /* borrowed; client outlives the layout */
+    uint8_t                    fh[NFS4_FHSIZE];
+    uint16_t                   fh_len;
+    uint32_t                   seqid;   /* server-incremented layout stateid seqid */
+    uint32_t                   iomode;  /* current LAYOUTIOMODE4 */
 
-    uint8_t            shard;
-    uint32_t           slot_idx;
-    uint32_t           generation;
+    uint8_t                    shard;
+    uint32_t                   slot_idx;
+    uint32_t                   generation;
 
-    UT_hash_handle     hh;              /* by fh in client->layouts_by_fh */
+    /* Outstanding CB_LAYOUTRECALL state: ops waiting for the client to return
+     * this layout (guarded by client->lock). */
+    uint8_t                    recall_active;
+    struct nfs4_recall_waiter *recall_waiters;
 
-    _Atomic uint32_t   refcount;
-    _Atomic uint8_t    destroyed;
+    UT_hash_handle             hh;      /* by fh in client->layouts_by_fh */
+
+    _Atomic uint32_t           refcount;
+    _Atomic uint8_t            destroyed;
 };
 
 /*

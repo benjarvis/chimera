@@ -18,6 +18,7 @@
 #include "nfs4_procs.h"
 #include "nfs4_state.h"
 #include "nfs4_status.h"
+#include "nfs4_cb.h"
 #include "nfs_internal.h"
 #include "vfs/vfs_pnfs.h"
 #include "vfs/vfs_procs.h"
@@ -541,6 +542,9 @@ chimera_nfs4_layoutreturn(
             nfs_layout_state_find(client, req->fh, req->fhlen);
 
         if (layout) {
+            /* Stage two of a recall: release any operation deferred while
+             * waiting for this return, then drop the layout record. */
+            chimera_nfs4_layout_recall_resolve(client, req->fh, req->fhlen);
             nfs_layout_state_destroy(layout,
                                      &thread->shared->nfs4_state_table,
                                      thread->vfs_thread);

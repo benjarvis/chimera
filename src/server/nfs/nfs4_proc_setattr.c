@@ -91,6 +91,22 @@ chimera_nfs4_setattr_open_callback(
                         req);
 } /* chimera_nfs4_setattr_open_callback */
 
+/* Open the target and apply the attributes.  Invoked directly, or as the
+ * resume continuation once a conflicting layout has been recalled. */
+static void
+nfs4_setattr_proceed(void *arg)
+{
+    struct nfs_request *req = arg;
+
+    chimera_vfs_open_fh(req->thread->vfs_thread,
+                        &req->cred,
+                        req->fh,
+                        req->fhlen,
+                        CHIMERA_VFS_OPEN_INFERRED | CHIMERA_VFS_OPEN_PATH,
+                        chimera_nfs4_setattr_open_callback,
+                        req);
+} /* nfs4_setattr_proceed */
+
 void
 chimera_nfs4_setattr(
     struct chimera_server_nfs_thread *thread,
@@ -161,19 +177,16 @@ chimera_nfs4_setattr(
     }
 
     /* A size change conflicts with any outstanding writable layout for the
-     * file: recall it so the client flushes its data to the data server and
-     * returns the layout.  No-op if no layout is held. */
+     * file.  Recall it and defer the truncate until the client has flushed its
+     * data to the data server and returned the layout (two-stage recall); if no
+     * layout is held, nfs4_setattr_proceed runs immediately. */
     if (args->obj_attributes.num_attrmask >= 1 &&
         (args->obj_attributes.attrmask[0] & (1 << FATTR4_SIZE)) &&
         req->session) {
-        chimera_nfs4_cb_recall_layout(thread, req->session, req->fh, req->fhlen);
+        chimera_nfs4_cb_recall_and_wait(thread, req->session, req->fh, req->fhlen,
+                                        nfs4_setattr_proceed, req);
+        return;
     }
 
-    chimera_vfs_open_fh(thread->vfs_thread,
-                        &req->cred,
-                        req->fh,
-                        req->fhlen,
-                        CHIMERA_VFS_OPEN_INFERRED | CHIMERA_VFS_OPEN_PATH,
-                        chimera_nfs4_setattr_open_callback,
-                        req);
+    nfs4_setattr_proceed(req);
 } /* chimera_nfs4_setattr */
