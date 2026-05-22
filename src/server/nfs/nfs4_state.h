@@ -179,6 +179,12 @@ struct nfs_client {
      * Cascade-freed in nfs_client_destroy on lease expiry / DESTROY_CLIENTID. */
     struct nfs_layout_state *layouts_by_fh;
 
+    /* A session of this client whose connection carries the NFSv4.1
+     * backchannel, used to send CB_COMPOUND (e.g. CB_LAYOUTRECALL) to this
+     * client.  Borrowed pointer set at CREATE_SESSION; cleared when the session
+     * is freed.  NULL if the client has no backchannel. */
+    struct nfs4_session     *cb_session;
+
     UT_hash_handle           hh_by_owner;
     UT_hash_handle           hh_by_id;
 
@@ -277,37 +283,36 @@ struct nfs_lock_state {
  * layout per file and does not implement recall, so the record exists mainly
  * to mint and validate the layout stateid and to be torn down with the client.
  */
-/* A conflicting operation (e.g. truncate) deferred until the client returns a
- * recalled layout.  resume(arg) runs once the layout is returned (LAYOUTRETURN)
- * or the client confirms it no longer holds it. */
-struct nfs4_recall_waiter {
-    void                       (*resume)(
-        void *arg);
-    void                      *arg;
-    struct nfs4_recall_waiter *next;
-};
+struct nfs_layout_table;
 
 struct nfs_layout_state {
-    struct nfs_client         *client;  /* borrowed; client outlives the layout */
-    uint8_t                    fh[NFS4_FHSIZE];
-    uint16_t                   fh_len;
-    uint32_t                   seqid;   /* server-incremented layout stateid seqid */
-    uint32_t                   iomode;  /* current LAYOUTIOMODE4 */
+    struct nfs_client       *client;    /* borrowed; client outlives the layout */
+    uint8_t                  fh[NFS4_FHSIZE];
+    uint16_t                 fh_len;
+    uint32_t                 seqid;     /* server-incremented layout stateid seqid */
+    uint32_t                 iomode;    /* current LAYOUTIOMODE4 */
 
-    uint8_t                    shard;
-    uint32_t                   slot_idx;
-    uint32_t                   generation;
+    uint8_t                  shard;
+    uint32_t                 slot_idx;
+    uint32_t                 generation;
 
-    /* Outstanding CB_LAYOUTRECALL state: ops waiting for the client to return
-     * this layout (guarded by client->lock). */
-    uint8_t                    recall_active;
-    struct nfs4_recall_waiter *recall_waiters;
+    /* Membership in the server-wide layout table (keyed by fh): the table this
+     * layout is registered in, and the next holder of the same file. */
+    struct nfs_layout_table *global_table;
+    struct nfs_layout_state *global_next;
 
-    UT_hash_handle             hh;      /* by fh in client->layouts_by_fh */
+    UT_hash_handle           hh;        /* by fh in client->layouts_by_fh */
 
-    _Atomic uint32_t           refcount;
-    _Atomic uint8_t            destroyed;
+    _Atomic uint32_t         refcount;
+    _Atomic uint8_t          destroyed;
 };
+
+/* Refcount helpers for pinning a layout across a recall (the table snapshots
+ * holders under its shard lock, then the recaller works with them unlocked). */
+void nfs_layout_state_get(
+    struct nfs_layout_state *st);
+void nfs_layout_state_put(
+    struct nfs_layout_state *st);
 
 /*
  * Slot table.
@@ -530,13 +535,14 @@ nfs_layout_state_find(
  * encoded layout stateid (seqid = 1) to out_stateid.  Lifetime ref = 1. */
 SYMBOL_EXPORT struct nfs_layout_state *
 nfs_layout_state_create(
-    struct nfs_client      *client,
-    const uint8_t          *fh,
-    uint16_t                fh_len,
-    uint32_t                iomode,
-    uint32_t                client_short_id,
-    struct nfs_state_table *table,
-    struct stateid4        *out_stateid);
+    struct nfs_client       *client,
+    const uint8_t           *fh,
+    uint16_t                 fh_len,
+    uint32_t                 iomode,
+    uint32_t                 client_short_id,
+    struct nfs_state_table  *table,
+    struct nfs_layout_table *layout_table,
+    struct stateid4         *out_stateid);
 
 /* Advance the layout stateid seqid and re-encode (subsequent LAYOUTGET /
  * LAYOUTRETURN on an existing layout). */

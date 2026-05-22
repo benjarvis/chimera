@@ -177,6 +177,10 @@ ip netns add "${NETNS_NAME}"
 ip netns exec "${NETNS_NAME}" ip link set lo up
 ip netns exec "${NETNS_NAME}" ip tuntap add dev "${TAP_NAME}" mode tap
 ip netns exec "${NETNS_NAME}" ip addr add 10.0.0.1/24 dev "${TAP_NAME}"
+# A second server address: the Linux NFS client keys its client-id on the
+# server address, so a guest mounting both 10.0.0.1 and 10.0.0.5 acts as two
+# distinct pNFS clients -- enough to exercise inter-client layout recall.
+ip netns exec "${NETNS_NAME}" ip addr add 10.0.0.5/24 dev "${TAP_NAME}"
 ip netns exec "${NETNS_NAME}" ip link set "${TAP_NAME}" up
 
 # 1. Start the data server (must be up before the MDS, which mounts it at boot).

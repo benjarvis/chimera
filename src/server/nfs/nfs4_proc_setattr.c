@@ -177,13 +177,14 @@ chimera_nfs4_setattr(
     }
 
     /* A size change conflicts with any outstanding writable layout for the
-     * file.  Recall it and defer the truncate until the client has flushed its
-     * data to the data server and returned the layout (two-stage recall); if no
-     * layout is held, nfs4_setattr_proceed runs immediately. */
+     * file -- held by this client or any other.  Recall it from every holder
+     * and defer the truncate until they have flushed to the data server and
+     * returned their layouts (two-stage recall); if none is held,
+     * nfs4_setattr_proceed runs immediately. */
     if (args->obj_attributes.num_attrmask >= 1 &&
         (args->obj_attributes.attrmask[0] & (1 << FATTR4_SIZE)) &&
-        req->session) {
-        chimera_nfs4_cb_recall_and_wait(thread, req->session, req->fh, req->fhlen,
+        chimera_vfs_pnfs_enabled(thread->shared->vfs)) {
+        chimera_nfs4_cb_recall_and_wait(thread, req->fh, req->fhlen,
                                         nfs4_setattr_proceed, req);
         return;
     }

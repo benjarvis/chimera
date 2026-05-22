@@ -6,6 +6,8 @@
 #include <string.h>
 
 #include "nfs4_state.h"
+#include "nfs4_session.h"
+#include "nfs4_layout_table.h"
 #include "nfs_internal.h"
 #include "vfs/vfs_release.h"
 
@@ -488,6 +490,19 @@ nfs_client_destroy(
         return;
     }
 
+    /* Release the backchannel session ref the client held (see CREATE_SESSION). */
+    {
+        struct nfs4_session *cb;
+
+        pthread_mutex_lock(&client->lock);
+        cb                 = client->cb_session;
+        client->cb_session = NULL;
+        pthread_mutex_unlock(&client->lock);
+        if (cb) {
+            nfs4_session_put(cb);
+        }
+    }
+
     pthread_mutex_lock(&client->lock);
 
     /* HASH_ITER + HASH_DELETE + free is the standard uthash teardown
@@ -778,13 +793,14 @@ nfs_layout_state_find(
 
 struct nfs_layout_state *
 nfs_layout_state_create(
-    struct nfs_client      *client,
-    const uint8_t          *fh,
-    uint16_t                fh_len,
-    uint32_t                iomode,
-    uint32_t                client_short_id,
-    struct nfs_state_table *table,
-    struct stateid4        *out_stateid)
+    struct nfs_client       *client,
+    const uint8_t           *fh,
+    uint16_t                 fh_len,
+    uint32_t                 iomode,
+    uint32_t                 client_short_id,
+    struct nfs_state_table  *table,
+    struct nfs_layout_table *layout_table,
+    struct stateid4         *out_stateid)
 {
     struct nfs_layout_state *st;
     uint8_t                  shard;
@@ -802,12 +818,13 @@ nfs_layout_state_create(
 
     st->client = client;
     memcpy(st->fh, fh, fh_len);
-    st->fh_len     = fh_len;
-    st->seqid      = 1;
-    st->iomode     = iomode;
-    st->shard      = shard;
-    st->slot_idx   = slot_idx;
-    st->generation = gen;
+    st->fh_len       = fh_len;
+    st->seqid        = 1;
+    st->iomode       = iomode;
+    st->shard        = shard;
+    st->slot_idx     = slot_idx;
+    st->generation   = gen;
+    st->global_table = layout_table;
     atomic_init(&st->refcount, 1);
     atomic_init(&st->destroyed, 0);
 
@@ -816,6 +833,10 @@ nfs_layout_state_create(
     pthread_mutex_lock(&client->lock);
     HASH_ADD_KEYPTR(hh, client->layouts_by_fh, st->fh, st->fh_len, st);
     pthread_mutex_unlock(&client->lock);
+
+    /* Publish into the server-wide fh->holder index so a conflicting op from
+     * any client can find and recall this layout. */
+    nfs_layout_table_register(layout_table, st);
 
     nfs4_stateid_encode(out_stateid, st->seqid, NFS4_STATEID_TYPE_LAYOUT,
                         shard, slot_idx, gen, client_short_id);
@@ -854,6 +875,12 @@ layout_state_destroy_locked(
         return;
     }
 
+    /* Drop from the server-wide fh->holder index; if this was the last holder
+     * of the file, that resumes any operation deferred on its recall. */
+    if (st->global_table) {
+        nfs_layout_table_deregister(st->global_table, st);
+    }
+
     HASH_DEL(client->layouts_by_fh, st);
 
     nfs_state_table_free_slot(table, st->shard, st->slot_idx);
@@ -863,6 +890,20 @@ layout_state_destroy_locked(
         free(st);
     }
 } /* layout_state_destroy_locked */
+
+void
+nfs_layout_state_get(struct nfs_layout_state *st)
+{
+    atomic_fetch_add_explicit(&st->refcount, 1, memory_order_acq_rel);
+} /* nfs_layout_state_get */
+
+void
+nfs_layout_state_put(struct nfs_layout_state *st)
+{
+    if (atomic_fetch_sub_explicit(&st->refcount, 1, memory_order_acq_rel) == 1) {
+        free(st);
+    }
+} /* nfs_layout_state_put */
 
 void
 nfs_layout_state_destroy(

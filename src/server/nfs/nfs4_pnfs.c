@@ -18,7 +18,6 @@
 #include "nfs4_procs.h"
 #include "nfs4_state.h"
 #include "nfs4_status.h"
-#include "nfs4_cb.h"
 #include "nfs_internal.h"
 #include "vfs/vfs_pnfs.h"
 #include "vfs/vfs_procs.h"
@@ -293,7 +292,9 @@ ff_lg_emit(struct ff_layoutget_ctx *ctx)
         nfs_layout_state_bump(layout, client_short_id, &res->logr_resok4.logr_stateid);
     } else {
         nfs_layout_state_create(client, req->fh, req->fhlen, args->loga_iomode,
-                                client_short_id, table, &res->logr_resok4.logr_stateid);
+                                client_short_id, table,
+                                &req->thread->shared->nfs4_layout_table,
+                                &res->logr_resok4.logr_stateid);
     }
 
     body = xdr_dbuf_alloc_space(256, req->encoding->dbuf);
@@ -542,9 +543,9 @@ chimera_nfs4_layoutreturn(
             nfs_layout_state_find(client, req->fh, req->fhlen);
 
         if (layout) {
-            /* Stage two of a recall: release any operation deferred while
-             * waiting for this return, then drop the layout record. */
-            chimera_nfs4_layout_recall_resolve(client, req->fh, req->fhlen);
+            /* Destroying the layout deregisters it from the server-wide table;
+             * if it was the last holder of this file, that resumes any
+             * operation deferred while its recall was outstanding (stage two). */
             nfs_layout_state_destroy(layout,
                                      &thread->shared->nfs4_state_table,
                                      thread->vfs_thread);
