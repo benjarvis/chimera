@@ -42,8 +42,18 @@ set(SMB_CTHON_CMD_special "cd /opt/cthon04 && CIFS=yes MNTOPTIONS=vers=2.1 ./run
 # wrote can only succeed if the client actually used pNFS to reach the data
 # server -- there is no MDS fallback to mask a broken layout.  The explicit
 # LAYOUTGET check in mountstats is a belt-and-suspenders positive assertion.
-set(PNFS_PROGRAMS rw)
+set(PNFS_PROGRAMS rw recall_truncate remove)
 set(PNFS_CMD_rw "mkdir -p /mnt/test && dd if=/dev/urandom of=/tmp/orig bs=1M count=8 2>/dev/null && cp /tmp/orig /mnt/test/f0 && sync && grep -qi LAYOUTGET /proc/self/mountstats && (echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true) && cmp /tmp/orig /mnt/test/f0")
+
+# Truncate a file that has an outstanding layout: the MDS recalls it, defers the
+# truncate until the client resolves the recall, then truncates.  Verifies the
+# surviving data (first 4 MiB) is intact -- both that the recall path runs and
+# that it does not corrupt data.
+set(PNFS_CMD_recall_truncate "mkdir -p /mnt/test && dd if=/dev/urandom of=/tmp/orig bs=1M count=8 2>/dev/null && cp /tmp/orig /mnt/test/f0 && sync && grep -qi LAYOUTGET /proc/self/mountstats && truncate -s 4194304 /mnt/test/f0 && (echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true) && head -c 4194304 /tmp/orig > /tmp/orig4 && cmp /tmp/orig4 /mnt/test/f0")
+
+# Remove a pNFS-backed file: the MDS deletes the backing file on the data server
+# and the name is gone from the namespace.
+set(PNFS_CMD_remove "mkdir -p /mnt/test && dd if=/dev/urandom of=/mnt/test/f0 bs=1M count=4 2>/dev/null && sync && grep -qi LAYOUTGET /proc/self/mountstats && rm /mnt/test/f0 && ! test -e /mnt/test/f0")
 
 # xfstests programs
 set(XFSTESTS_PROGRAMS fsstress fsx dirstress nametest fstest rewinddir)
