@@ -3652,7 +3652,8 @@ diskfs_bt_free_tree(
     h   = diskfs_bt_hdr(buf, DISKFS_BT_ROOT_BASE);
 
     if (h->level == 0 && S_ISREG(inode->mode)) {
-        /* Small file: every data extent is recorded in the embedded root. */
+        /* Small file: data extents are recorded in the embedded root, mixed
+         * with non-space records such as xattrs. */
         struct diskfs_bt_lslot *s = diskfs_bt_lslots(buf, DISKFS_BT_ROOT_BASE);
         int                     i;
 
@@ -3660,6 +3661,9 @@ diskfs_bt_free_tree(
             struct diskfs_extent_rec *e =
                 (struct diskfs_extent_rec *) ((char *) buf + DISKFS_BT_ROOT_BASE + s[i].off);
 
+            if (s[i].key.type != DISKFS_REC_EXTENT) {
+                continue;
+            }
             diskfs_txn_free_space(thread, txn, e->device_id, e->device_offset,
                                   SM_ALIGN_UP(e->length));
         }
@@ -5972,7 +5976,7 @@ diskfs_il_contig_free(struct diskfs_intent_log *il)
     uint64_t start = SM_INTENT_LOG_OFFSET;
     uint64_t end   = SM_INTENT_LOG_OFFSET + SM_INTENT_LOG_SIZE;
 
-    if (!il->push_head) {
+    if (!il->push_cur && !il->push_head && il->redo_inflight == 0) {
         return SM_INTENT_LOG_SIZE;
     }
     if (il->log_head >= il->log_tail) {
@@ -6072,7 +6076,14 @@ diskfs_il_push_finish(struct diskfs_intent_log *il)
     free(rec->iovs);
     free(rec);
 
-    il->log_tail = il->push_head ? il->push_head->offset : il->log_head;
+    /* Redo records reserve log space before they enter push_head.  If newer
+     * redo writes are still in flight, keep log_tail conservative until those
+     * records become pushable and then finish. */
+    if (il->push_head) {
+        il->log_tail = il->push_head->offset;
+    } else if (il->redo_inflight == 0) {
+        il->log_tail = il->log_head;
+    }
 
     diskfs_il_push_kick(il);
 
@@ -6469,6 +6480,7 @@ diskfs_intent_log_drain_pending(struct diskfs_intent_log *il)
                                 "intent log: too many channels (%u >= %u)",
                                 il->num_channels, DISKFS_IL_MAX_CHANNELS);
         il->channels[il->num_channels++] = ch;
+
         __atomic_store_n(&ch->registered, 1, __ATOMIC_RELEASE);
     }
 } /* diskfs_intent_log_drain_pending */
@@ -6825,9 +6837,18 @@ diskfs_mount_io_read(
     uint64_t length,
     uint64_t offset)
 {
-    struct diskfs_mount_io *io     = user;
-    uint64_t                maxreq = io->shared->devices[device_id].max_request_size;
-    uint64_t                done   = 0;
+    struct diskfs_mount_io *io = user;
+    uint64_t                maxreq;
+    uint64_t                done = 0;
+
+    if (device_id >= (uint32_t) io->shared->num_devices ||
+        !io->queue[device_id]) {
+        return -1;
+    }
+    maxreq = io->shared->devices[device_id].max_request_size;
+    if (maxreq == 0) {
+        return -1;
+    }
 
     while (done < length) {
         struct evpl_iovec           iov;
@@ -6867,9 +6888,18 @@ diskfs_mount_io_write(
     uint64_t    length,
     uint64_t    offset)
 {
-    struct diskfs_mount_io *io     = user;
-    uint64_t                maxreq = io->shared->devices[device_id].max_request_size;
-    uint64_t                done   = 0;
+    struct diskfs_mount_io *io = user;
+    uint64_t                maxreq;
+    uint64_t                done = 0;
+
+    if (device_id >= (uint32_t) io->shared->num_devices ||
+        !io->queue[device_id]) {
+        return -1;
+    }
+    maxreq = io->shared->devices[device_id].max_request_size;
+    if (maxreq == 0) {
+        return -1;
+    }
 
     while (done < length) {
         struct evpl_iovec           iov;
@@ -6920,9 +6950,17 @@ diskfs_mount_io_write_many(
     }
 
     for (i = 0; i < count; i++) {
-        struct diskfs_device *dev = &io->shared->devices[writes[i].device_id];
+        struct diskfs_device *dev;
 
-        if (writes[i].length > dev->max_request_size) {
+        if (writes[i].device_id >= (uint32_t) io->shared->num_devices ||
+            !io->queue[writes[i].device_id]) {
+            rc    = -1;
+            count = i;
+            goto out;
+        }
+        dev = &io->shared->devices[writes[i].device_id];
+
+        if (dev->max_request_size == 0 || writes[i].length > dev->max_request_size) {
             rc    = -1;
             count = i;
             goto out;
@@ -6969,6 +7007,11 @@ diskfs_mount_io_flush(
 {
     struct diskfs_mount_io     *io = user;
     struct diskfs_mount_io_wait w  = { 0, 0 };
+
+    if (device_id >= (uint32_t) io->shared->num_devices ||
+        !io->queue[device_id]) {
+        return -1;
+    }
 
     evpl_block_flush(io->evpl, io->queue[device_id], diskfs_mount_io_complete, &w);
     while (!w.done) {
@@ -7803,10 +7846,6 @@ diskfs_thread_init(
     pthread_mutex_unlock(&shared->intent_log.registration_lock);
 
     evpl_ring_doorbell(&shared->intent_log.wake_doorbell);
-    while (!__atomic_load_n(&thread->iq_channel->registered, __ATOMIC_ACQUIRE)) {
-        /* Wait until the intent-log thread has installed this channel so the
-         * first write does not also pay channel registration latency. */
-    }
 
     return thread;
 } /* diskfs_thread_init */
