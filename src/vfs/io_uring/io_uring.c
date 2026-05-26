@@ -567,7 +567,8 @@ chimera_io_uring_getattr(
 
     stx = (struct statx *) scratch;
 
-    io_uring_prep_statx(sqe, fd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW, AT_STATX_SYNC_AS_STAT, stx);
+    io_uring_prep_statx(sqe, fd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_STATX_SYNC_AS_STAT,
+                        STATX_BASIC_STATS, stx);
 
     evpl_defer(thread->evpl, &thread->deferral);
 } /* io_uring_getattr */
