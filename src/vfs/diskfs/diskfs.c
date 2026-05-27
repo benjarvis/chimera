@@ -447,12 +447,14 @@ struct diskfs_inode {
     uint32_t                    ctime_nsec;
     uint32_t                    mtime_nsec;
 
-    /* Inode-cache linkage, keyed by inum.  Lock state and the wait list
-     * below are protected by the owning shard's mutex, never held across
-     * a callback or I/O. */
+    /* Inode-cache linkage, keyed by inum.  The wait list is protected by the
+     * owning shard's mutex (never held across a callback or I/O).  The lock
+     * state is a single atomic word (`lockw`: bit 0 = exclusive writer held,
+     * bits 1+ = shared reader count) so the read hot path can acquire/release
+     * the shared lock with a lock-free CAS/fetch and touch the shard mutex only
+     * to grant a queued waiter or evaluate eviction (the last-reader release). */
     struct rb_node              node;
-    int                         readers;     /* shared-lock holders */
-    int                         writer;      /* 0/1 exclusive holder */
+    uint64_t                    lockw;       /* {writer:1, readers:N>>1}; atomic */
     struct diskfs_inode_waiter *wait_head;
     struct diskfs_inode_waiter *wait_tail;
 
@@ -1653,6 +1655,20 @@ diskfs_inode_lru_unlink(
 } /* diskfs_inode_lru_unlink */
 
 /*
+ * Inode lock word (inode->lockw): bit 0 is the exclusive-writer flag, bits 1+
+ * are the shared-reader count.  Readers acquire/release with a lock-free
+ * CAS/fetch (no shard mutex) when no writer holds; the shard mutex is taken
+ * only to grant a queued waiter, acquire a writer, or evaluate eviction on the
+ * last-reader release.  A writer is granted only when the word is 0 (no readers,
+ * no writer), via a CAS that fails if a lock-free reader has raced in -- in
+ * which case the writer waits, exactly as a continuous reader stream could
+ * delay a writer under the old all-under-lock FIFO.
+ */
+#define DISKFS_ILK_WRITER (1ULL << 0)
+#define DISKFS_ILK_READER (1ULL << 1)
+#define DISKFS_ILK_READERS(w) ((w) >> 1)
+
+/*
  * An idle inode is a recycle candidate: no open handle (refcnt == 1, the
  * cache's own reference), not locked, and live (nlink > 0).  Whether its
  * dinode is durable enough to drop is checked separately at recycle time.
@@ -1661,34 +1677,47 @@ diskfs_inode_lru_unlink(
 static inline int
 diskfs_inode_idle(const struct diskfs_inode *inode)
 {
-    return inode->refcnt == 1 && inode->readers == 0 &&
-           inode->writer == 0 && inode->nlink > 0;
+    return inode->refcnt == 1 &&
+           __atomic_load_n(&inode->lockw, __ATOMIC_ACQUIRE) == 0 &&
+           inode->nlink > 0;
 } /* diskfs_inode_idle */
 
-/* Caller must hold the inode's shard lock. */
+/* True if a lock of `mode` is compatible with the lock-word snapshot `w`. */
 static inline int
-diskfs_inode_lock_compatible(
-    struct diskfs_inode        *inode,
+diskfs_ilk_compatible(
+    uint64_t                    w,
     enum diskfs_inode_lock_mode mode)
 {
     if (mode == DISKFS_INODE_LOCK_WRITE) {
-        return inode->writer == 0 && inode->readers == 0;
+        return w == 0;                       /* exclusive: no readers, no writer */
     }
-    return inode->writer == 0;
-} /* diskfs_inode_lock_compatible */
+    return !(w & DISKFS_ILK_WRITER);         /* shared: only a writer conflicts */
+} /* diskfs_ilk_compatible */
 
-/* Caller must hold the inode's shard lock. */
-static inline void
-diskfs_inode_lock_grant(
+/*
+ * Try to grant a lock of `mode` on the lock word.  Caller holds the shard lock
+ * (so no other writer/grant runs concurrently), but lock-free readers may still
+ * add/drop shared holders.  Returns 1 on success.
+ *   WRITE: CAS 0 -> WRITER; fails if any reader raced in (then the writer waits).
+ *   READ:  if no writer, atomic-add a reader (commutes with lock-free readers).
+ */
+static inline int
+diskfs_ilk_try_grant(
     struct diskfs_inode        *inode,
     enum diskfs_inode_lock_mode mode)
 {
     if (mode == DISKFS_INODE_LOCK_WRITE) {
-        inode->writer = 1;
-    } else {
-        inode->readers++;
+        uint64_t expected = 0;
+        return __atomic_compare_exchange_n(&inode->lockw, &expected,
+                                           DISKFS_ILK_WRITER, 0,
+                                           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     }
-} /* diskfs_inode_lock_grant */
+    if (__atomic_load_n(&inode->lockw, __ATOMIC_ACQUIRE) & DISKFS_ILK_WRITER) {
+        return 0;
+    }
+    __atomic_fetch_add(&inode->lockw, DISKFS_ILK_READER, __ATOMIC_ACQ_REL);
+    return 1;
+} /* diskfs_ilk_try_grant */
 
 /*
  * Hand a granted (or stale-failed) waiter to its owning worker so its
@@ -1727,12 +1756,34 @@ diskfs_inode_release_one(
     struct diskfs_inode_waiter *granted = NULL;
     struct diskfs_inode_waiter *w;
 
-    pthread_mutex_lock(&shard->lock);
+    if (mode == DISKFS_INODE_LOCK_READ) {
+        /* Drop a shared holder lock-free *only while other readers remain*: the
+         * inode stays non-idle, so a concurrent recycle (which needs the shard
+         * lock AND idle) cannot free it in the gap.  The LAST reader decrements
+         * under the shard lock -- mutually exclusive with eviction -- so recycle
+         * never frees an inode a releaser is about to touch, and the last reader
+         * also drains waiters / evaluates idle.  Under heavy fan-in (the
+         * contended hot-file case) almost every drop hits the lock-free arm. */
+        uint64_t cur = __atomic_load_n(&inode->lockw, __ATOMIC_ACQUIRE);
 
-    if (mode == DISKFS_INODE_LOCK_WRITE) {
-        inode->writer = 0;
+        while (DISKFS_ILK_READERS(cur) > 1) {
+            chimera_diskfs_abort_if(cur & DISKFS_ILK_WRITER,
+                                    "inode read-release with writer held (lockw=%lu)", cur);
+            if (__atomic_compare_exchange_n(&inode->lockw, &cur,
+                                            cur - DISKFS_ILK_READER, 1,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                return;
+            }
+        }
+
+        pthread_mutex_lock(&shard->lock);
+        chimera_diskfs_abort_if(DISKFS_ILK_READERS(__atomic_load_n(&inode->lockw,
+                                                                   __ATOMIC_RELAXED)) == 0,
+                                "inode read-release underflow");
+        __atomic_fetch_sub(&inode->lockw, DISKFS_ILK_READER, __ATOMIC_ACQ_REL);
     } else {
-        inode->readers--;
+        pthread_mutex_lock(&shard->lock);
+        __atomic_and_fetch(&inode->lockw, ~DISKFS_ILK_WRITER, __ATOMIC_ACQ_REL);
     }
 
     while (inode->wait_head) {
@@ -1751,7 +1802,9 @@ diskfs_inode_release_one(
             continue;
         }
 
-        if (!diskfs_inode_lock_compatible(inode, w->mode)) {
+        /* try_grant both tests compatibility and takes the lock word; a WRITE
+        * grant fails if a lock-free reader has raced in (leave it queued). */
+        if (!diskfs_ilk_try_grant(inode, w->mode)) {
             break;
         }
 
@@ -1759,7 +1812,6 @@ diskfs_inode_release_one(
         if (!inode->wait_head) {
             inode->wait_tail = NULL;
         }
-        diskfs_inode_lock_grant(inode, w->mode);
         w->status = CHIMERA_VFS_OK;
         w->next   = granted;
         granted   = w;
@@ -1916,9 +1968,8 @@ diskfs_inode_acquire(
         return;
     }
 
-    if (diskfs_inode_lock_compatible(inode, mode)) {
+    if (diskfs_ilk_try_grant(inode, mode)) {
         diskfs_metric_inode_cache(thread, DISKFS_METRIC_INODE_CACHE_HIT);
-        diskfs_inode_lock_grant(inode, mode);
         diskfs_inode_lru_unlink(shard, inode);     /* busy now, not a candidate */
         pthread_mutex_unlock(&shard->lock);
         diskfs_txn_add_slot(txn, inode, mode);
@@ -1983,11 +2034,29 @@ diskfs_inode_acquire_pinned(
         }
     }
 
+    /* Lock-free shared acquire: the read hot path.  CAS a reader onto the lock
+     * word whenever no writer holds -- no shard mutex.  (The inode is pinned by
+     * the open handle, so it can't be recycled under us.) */
+    if (mode == DISKFS_INODE_LOCK_READ) {
+        uint64_t cur = __atomic_load_n(&inode->lockw, __ATOMIC_ACQUIRE);
+
+        while (!(cur & DISKFS_ILK_WRITER)) {
+            if (__atomic_compare_exchange_n(&inode->lockw, &cur,
+                                            cur + DISKFS_ILK_READER, 1,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                diskfs_txn_add_slot(txn, inode, mode);
+                cb(inode, CHIMERA_VFS_OK, private_data);
+                return;
+            }
+            /* CAS reloaded cur; retry unless a writer appeared. */
+        }
+        /* A writer holds -- fall through to queue under the shard lock. */
+    }
+
     shard = diskfs_inode_shard(thread->shared, inode->inum);
     pthread_mutex_lock(&shard->lock);
 
-    if (diskfs_inode_lock_compatible(inode, mode)) {
-        diskfs_inode_lock_grant(inode, mode);
+    if (diskfs_ilk_try_grant(inode, mode)) {
         diskfs_inode_lru_unlink(shard, inode);     /* no-op: pinned, not on LRU */
         pthread_mutex_unlock(&shard->lock);
         diskfs_txn_add_slot(txn, inode, mode);
@@ -6051,7 +6120,7 @@ diskfs_inode_struct_new(uint64_t inum)
     inode->inum   = inum;
     inode->gen    = 1;
     inode->refcnt = 1;
-    /* readers/writer/wait_head/wait_tail zeroed by calloc */
+    /* lockw/wait_head/wait_tail zeroed by calloc */
     return inode;
 } /* diskfs_inode_struct_new */
 
@@ -6316,7 +6385,7 @@ diskfs_inode_alloc_async(
     inode = diskfs_inode_struct_new(inum);
 
     /* New dirty inode: write-locked by this (write) txn from birth. */
-    inode->writer = 1;
+    inode->lockw = DISKFS_ILK_WRITER;
 
     diskfs_inode_cache_insert(shared, inode);
     diskfs_metric_inode_cache(thread, DISKFS_METRIC_INODE_CACHE_INSERT);
