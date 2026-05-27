@@ -41,22 +41,25 @@
         ((type *) ((char *) (ptr) - offsetof(type, member)))
 #endif /* ifndef container_of */
 
-/* Inode cache: sharded rb-tree keyed by inum. */
-#define DISKFS_INODE_CACHE_SHARDS 256
-#define DISKFS_INODE_CACHE_MASK   (DISKFS_INODE_CACHE_SHARDS - 1)
+/* Inode cache: sharded RCU chained hash keyed by inum.  256 shards select the
+ * lock (and the RCU read fast path needs none); each shard is a bucket array. */
+#define DISKFS_INODE_CACHE_SHARDS            256
+#define DISKFS_INODE_CACHE_MASK              (DISKFS_INODE_CACHE_SHARDS - 1)
+#define DISKFS_INODE_CACHE_BUCKETS_PER_SHARD 1024
+#define DISKFS_INODE_CACHE_BUCKET_MASK       (DISKFS_INODE_CACHE_BUCKETS_PER_SHARD - 1)
 
 /* Statically-reserved inums (block_idx in AG 0 / disk 0; see space_map.c).
  * inum 2 = root; inum 3 = orphan list (deleted inodes pending incremental
  * reclaim).  The orphan inode is a directory whose b+tree keys are orphan
  * inums; the drainer empties it. */
-#define DISKFS_ROOT_INUM          2
-#define DISKFS_ORPHAN_INUM        3
-#define DISKFS_ORPHAN_GEN         1   /* permanent: created at format, never deleted */
+#define DISKFS_ROOT_INUM                     2
+#define DISKFS_ORPHAN_INUM                   3
+#define DISKFS_ORPHAN_GEN                    1 /* permanent: created at format, never deleted */
 
 /* Max inodes a single transaction can hold locked at once.  rename needs
  * 4 (two parents, child, replaced target); others (e.g. readdir) touch
  * many but only 2 at a time and release as they go. */
-#define DISKFS_TXN_MAX_INODES     4
+#define DISKFS_TXN_MAX_INODES                4
 
 /* Diskfs RMW writes assemble:
  *   prefix (valid + zero) + request write iovecs +
@@ -64,8 +67,8 @@
  * The largest in-tree caller-side write iovec array is CHIMERA_CLIENT_IOV_MAX
  * (260); SMB is 256 and RPC transport receives are lower by default.
  */
-#define DISKFS_WRITE_MAX_IOV      260
-#define DISKFS_WRITE_RMW_MAX_IOV  (DISKFS_WRITE_MAX_IOV + 5)
+#define DISKFS_WRITE_MAX_IOV                 260
+#define DISKFS_WRITE_RMW_MAX_IOV             (DISKFS_WRITE_MAX_IOV + 5)
 
 #define chimera_diskfs_debug(...) chimera_debug("diskfs", \
                                                 __FILE__, \
@@ -453,7 +456,8 @@ struct diskfs_inode {
      * bits 1+ = shared reader count) so the read hot path can acquire/release
      * the shared lock with a lock-free CAS/fetch and touch the shard mutex only
      * to grant a queued waiter or evaluate eviction (the last-reader release). */
-    struct rb_node              node;
+    struct diskfs_inode        *hash_next;   /* RCU bucket chain (rcu_dereference) */
+    struct rcu_head             rcu;         /* deferred free on eviction */
     uint64_t                    lockw;       /* {writer:1, readers:N>>1}; atomic */
     struct diskfs_inode_waiter *wait_head;
     struct diskfs_inode_waiter *wait_tail;
@@ -475,10 +479,10 @@ struct diskfs_inode {
 };
 
 struct diskfs_inode_shard {
-    pthread_mutex_t      lock;
-    struct rb_tree       inodes;       /* keyed by inum */
-    struct diskfs_inode *lru_head, *lru_tail; /* idle (recycle) candidates, LRU-first */
-    uint32_t             ninodes;      /* resident inodes in this shard */
+    pthread_mutex_t       lock;
+    struct diskfs_inode **buckets;     /* [BUCKETS_PER_SHARD] RCU chained hash by inum */
+    struct diskfs_inode  *lru_head, *lru_tail; /* idle (recycle) candidates, LRU-first */
+    uint32_t              ninodes;     /* resident inodes in this shard */
 };
 
 struct diskfs_inode_cache {
@@ -1538,6 +1542,64 @@ diskfs_inode_shard(
     return &shared->inode_cache->shards[inum & DISKFS_INODE_CACHE_MASK];
 } /* diskfs_inode_shard */
 
+static inline uint32_t
+diskfs_inode_bucket(uint64_t inum)
+{
+    return (inum >> 8) & DISKFS_INODE_CACHE_BUCKET_MASK;
+} /* diskfs_inode_bucket */
+
+/* Find a resident inode by inum.  In Increment 1 the caller holds the shard
+ * lock; in Increment 2 the lock-free read path wraps this in an RCU read-side
+ * section (the rcu_dereference walk is valid either way). */
+static inline struct diskfs_inode *
+diskfs_inode_lookup_locked(
+    struct diskfs_inode_shard *shard,
+    uint32_t                   bucket,
+    uint64_t                   inum)
+{
+    struct diskfs_inode *in;
+
+    for (in = rcu_dereference(shard->buckets[bucket]); in;
+         in = rcu_dereference(in->hash_next)) {
+        if (in->inum == inum) {
+            return in;
+        }
+    }
+    return NULL;
+} /* diskfs_inode_lookup_locked */
+
+/* Publish an inode into its bucket.  Caller holds the shard lock. */
+static inline void
+diskfs_inode_hash_insert(
+    struct diskfs_inode_shard *shard,
+    uint32_t                   bucket,
+    struct diskfs_inode       *inode)
+{
+    inode->hash_next = shard->buckets[bucket];
+    rcu_assign_pointer(shard->buckets[bucket], inode);
+} /* diskfs_inode_hash_insert */
+
+/* Unhook an inode from its bucket.  Caller holds the shard lock. */
+static inline void
+diskfs_inode_hash_remove(
+    struct diskfs_inode_shard *shard,
+    uint32_t                   bucket,
+    struct diskfs_inode       *inode)
+{
+    struct diskfs_inode *cur, *prev = NULL;
+
+    for (cur = shard->buckets[bucket]; cur; prev = cur, cur = cur->hash_next) {
+        if (cur == inode) {
+            if (prev) {
+                rcu_assign_pointer(prev->hash_next, cur->hash_next);
+            } else {
+                rcu_assign_pointer(shard->buckets[bucket], cur->hash_next);
+            }
+            break;
+        }
+    }
+} /* diskfs_inode_hash_remove */
+
 static inline struct diskfs_inode_waiter *
 diskfs_waiter_alloc(struct diskfs_thread *thread)
 {
@@ -1664,9 +1726,10 @@ diskfs_inode_lru_unlink(
  * which case the writer waits, exactly as a continuous reader stream could
  * delay a writer under the old all-under-lock FIFO.
  */
-#define DISKFS_ILK_WRITER (1ULL << 0)
-#define DISKFS_ILK_READER (1ULL << 1)
-#define DISKFS_ILK_READERS(w) ((w) >> 1)
+#define DISKFS_ILK_WRITER     (1ULL << 0)
+#define DISKFS_ILK_RECLAIMING (1ULL << 1) /* recycle claimed it; readers must bail */
+#define DISKFS_ILK_READER     (1ULL << 2)
+#define DISKFS_ILK_READERS(w) ((w) >> 2)
 
 /*
  * An idle inode is a recycle candidate: no open handle (refcnt == 1, the
@@ -1939,9 +2002,44 @@ diskfs_inode_acquire(
     }
 
     shard = diskfs_inode_shard(thread->shared, inum);
+
+    /* Lock-free RCU read fast path -- the NFSv3 synthetic-handle hot path.
+     * Resolve the inode by inum and pin it with a shared lock, no shard mutex.
+     * The shared lock (readers>0) is the pin: it makes the inode non-idle, so
+     * recycle's RECLAIMING claim CASes against us.  Bail to the locked slow path
+     * on a writer, a concurrent reclaim, or a miss. */
+    if (mode == DISKFS_INODE_LOCK_READ) {
+        urcu_memb_read_lock();
+        inode = diskfs_inode_lookup_locked(shard, diskfs_inode_bucket(inum), inum);
+        if (inode) {
+            uint64_t w = __atomic_load_n(&inode->lockw, __ATOMIC_ACQUIRE);
+
+            while (!(w & (DISKFS_ILK_WRITER | DISKFS_ILK_RECLAIMING))) {
+                if (__atomic_compare_exchange_n(&inode->lockw, &w,
+                                                w + DISKFS_ILK_READER, 1,
+                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                    urcu_memb_read_unlock();
+                    /* Pinned: recycle is now excluded, so the gen read is safe. */
+                    if (unlikely(inode->gen != gen)) {
+                        diskfs_metric_inode_cache(thread, DISKFS_METRIC_INODE_CACHE_STALE);
+                        diskfs_inode_release_one(thread, inode, DISKFS_INODE_LOCK_READ);
+                        cb(NULL, CHIMERA_VFS_ENOENT, private_data);
+                        return;
+                    }
+                    diskfs_metric_inode_cache(thread, DISKFS_METRIC_INODE_CACHE_HIT);
+                    diskfs_txn_add_slot(txn, inode, DISKFS_INODE_LOCK_READ);
+                    cb(inode, CHIMERA_VFS_OK, private_data);
+                    return;
+                }
+                /* CAS reloaded w; retry unless a writer/reclaim appeared. */
+            }
+        }
+        urcu_memb_read_unlock();
+    }
+
     pthread_mutex_lock(&shard->lock);
 
-    rb_tree_query_exact(&shard->inodes, inum, inum, inode);
+    inode = diskfs_inode_lookup_locked(shard, diskfs_inode_bucket(inum), inum);
 
     if (unlikely(inode && inode->gen != gen)) {
         /* Cached under a different generation: the handle is stale. */
@@ -2181,7 +2279,7 @@ diskfs_inode_load_sync(
     /* Already resident (e.g. a freshly-bootstrapped root/orphan inode, or a
      * prior fault): return it without touching disk. */
     pthread_mutex_lock(&shard->lock);
-    rb_tree_query_exact(&shard->inodes, inum, inum, inode);
+    inode = diskfs_inode_lookup_locked(shard, diskfs_inode_bucket(inum), inum);
     if (inode) {
         int ok = (inode->gen == gen && (inode->nlink != 0 || allow_orphan));
 
@@ -2205,7 +2303,7 @@ diskfs_inode_load_sync(
     }
 
     pthread_mutex_lock(&shard->lock);
-    rb_tree_query_exact(&shard->inodes, inum, inum, inode);
+    inode = diskfs_inode_lookup_locked(shard, diskfs_inode_bucket(inum), inum);
     if (!inode) {
         diskfs_inode_cache_recycle_locked(shared, shard);
         inode              = calloc(1, sizeof(*inode));
@@ -2227,7 +2325,7 @@ diskfs_inode_load_sync(
         inode->ctime_nsec  = di->ctime_nsec;
         inode->parent_inum = di->parent_inum;
         inode->parent_gen  = di->parent_gen;
-        rb_tree_insert(&shard->inodes, inum, inode);
+        diskfs_inode_hash_insert(shard, diskfs_inode_bucket(inode->inum), inode);
         shard->ninodes++;
         diskfs_metric_inode_cache(thread, DISKFS_METRIC_INODE_CACHE_LOAD);
     }
@@ -6120,9 +6218,17 @@ diskfs_inode_struct_new(uint64_t inum)
     inode->inum   = inum;
     inode->gen    = 1;
     inode->refcnt = 1;
-    /* lockw/wait_head/wait_tail zeroed by calloc */
+    /* lockw/wait_head/wait_tail/hash_next zeroed by calloc */
     return inode;
 } /* diskfs_inode_struct_new */
+
+/* Deferred free of an evicted inode: runs after a grace period, so any
+ * lock-free RCU reader that grabbed a now-unhooked pointer has finished. */
+static void
+diskfs_inode_rcu_free(struct rcu_head *rcu)
+{
+    free(container_of(rcu, struct diskfs_inode, rcu));
+} /* diskfs_inode_rcu_free */
 
 /*
  * An inode struct may be dropped only when its dinode is durably home, so a
@@ -6181,10 +6287,24 @@ diskfs_inode_cache_recycle_locked(
             continue;                                  /* not durable yet; skip */
         }
 
+        /* Claim via the RECLAIMING sentinel: an idle inode has lockw==0, so the
+         * CAS succeeds unless a lock-free reader pinned it between the idle check
+         * and here -- in which case it's no longer idle, so skip it. */
+        {
+            uint64_t expected = 0;
+            if (!__atomic_compare_exchange_n(&inode->lockw, &expected,
+                                             DISKFS_ILK_RECLAIMING, 0,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                diskfs_inode_lru_unlink(shard, inode);     /* went busy; self-heal */
+                continue;
+            }
+        }
+
         diskfs_inode_lru_unlink(shard, inode);
-        rb_tree_remove(&shard->inodes, &inode->node);
+        diskfs_inode_hash_remove(shard, diskfs_inode_bucket(inode->inum), inode);
         shard->ninodes--;
-        free(inode);
+        /* Deferred free: a lock-free reader may hold a just-unhooked pointer. */
+        call_rcu(&inode->rcu, diskfs_inode_rcu_free);
         return;
     }
 } /* diskfs_inode_cache_recycle_locked */
@@ -6198,7 +6318,7 @@ diskfs_inode_cache_insert(
 
     pthread_mutex_lock(&shard->lock);
     diskfs_inode_cache_recycle_locked(shared, shard);
-    rb_tree_insert(&shard->inodes, inum, inode);
+    diskfs_inode_hash_insert(shard, diskfs_inode_bucket(inode->inum), inode);
     shard->ninodes++;
     pthread_mutex_unlock(&shard->lock);
 } /* diskfs_inode_cache_insert */
@@ -6245,7 +6365,7 @@ diskfs_inode_load_complete(
     }
 
     pthread_mutex_lock(&shard->lock);
-    rb_tree_query_exact(&shard->inodes, lc->inum, inum, inode);
+    inode = diskfs_inode_lookup_locked(shard, diskfs_inode_bucket(lc->inum), lc->inum);
     if (!inode) {
         diskfs_inode_cache_recycle_locked(shared, shard);
         inode              = diskfs_inode_struct_new(lc->inum);
@@ -6265,7 +6385,7 @@ diskfs_inode_load_complete(
         inode->ctime_nsec  = di->ctime_nsec;
         inode->parent_inum = di->parent_inum;
         inode->parent_gen  = di->parent_gen;
-        rb_tree_insert(&shard->inodes, inum, inode);
+        diskfs_inode_hash_insert(shard, diskfs_inode_bucket(inode->inum), inode);
         shard->ninodes++;
         diskfs_metric_inode_cache(thread, DISKFS_METRIC_INODE_CACHE_LOAD);
     }
@@ -8345,7 +8465,8 @@ diskfs_init(
         shared->inode_cache->shard_cap = 1;
     }
     for (i = 0; i < DISKFS_INODE_CACHE_SHARDS; i++) {
-        rb_tree_init(&shared->inode_cache->shards[i].inodes);
+        shared->inode_cache->shards[i].buckets =
+            calloc(DISKFS_INODE_CACHE_BUCKETS_PER_SHARD, sizeof(struct diskfs_inode *));
         pthread_mutex_init(&shared->inode_cache->shards[i].lock, NULL);
     }
 
@@ -8512,29 +8633,32 @@ diskfs_bootstrap(struct diskfs_thread *thread)
 } /* diskfs_bootstrap */
 
 static void
-diskfs_inode_cache_release(
-    struct rb_node *node,
-    void           *private_data)
-{
-    struct diskfs_inode *inode = container_of(node, struct diskfs_inode, node);
-
-    (void) private_data;
-
-    /* All inode contents live in b+tree blocks freed via the block cache;
-     * we only own and must free the inode struct itself (heap-allocated). */
-    free(inode);
-} /* diskfs_inode_cache_release */
-
-static void
 diskfs_destroy(void *private_data)
 {
     struct diskfs_shared *shared = private_data;
     int                   i;
+    uint32_t              b;
 
+    /* Flush any pending deferred inode frees (call_rcu) before we walk + free
+     * the cache directly. */
+    rcu_barrier();
+
+    /* Workers are gone by teardown, so no RCU reader can be mid-walk; free the
+     * inode structs directly (all contents live in block-cache b+tree blocks). */
     for (i = 0; i < DISKFS_INODE_CACHE_SHARDS; i++) {
-        rb_tree_destroy(&shared->inode_cache->shards[i].inodes,
-                        diskfs_inode_cache_release, NULL);
-        pthread_mutex_destroy(&shared->inode_cache->shards[i].lock);
+        struct diskfs_inode_shard *shard = &shared->inode_cache->shards[i];
+
+        for (b = 0; b < DISKFS_INODE_CACHE_BUCKETS_PER_SHARD; b++) {
+            struct diskfs_inode *inode = shard->buckets[b], *next;
+
+            while (inode) {
+                next = inode->hash_next;
+                free(inode);
+                inode = next;
+            }
+        }
+        free(shard->buckets);
+        pthread_mutex_destroy(&shard->lock);
     }
 
     /* Shut down the intent log thread before tearing down anything it
