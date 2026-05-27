@@ -1539,18 +1539,31 @@ diskfs_fh_to_inum(
         ((txn)->type == DISKFS_TXN_WRITE ? DISKFS_INODE_LOCK_WRITE \
                                          : DISKFS_INODE_LOCK_READ)
 
+/*
+ * Mix the inum before deriving shard/bucket.  inums are
+ * (disk<<56 | ag<<32 | block_idx) where block_idx is a small, often dense or
+ * stride-correlated integer, so the raw low bits cluster heavily into a few
+ * shards/buckets -> long hash chains (this dominated the read profile).  Use
+ * the VFS XXH3 helper to avalanche the bits, as everywhere else in the tree.
+ */
+static inline uint64_t
+diskfs_inum_hash(uint64_t inum)
+{
+    return chimera_vfs_hash(&inum, sizeof(inum));
+} /* diskfs_inum_hash */
+
 static inline struct diskfs_inode_shard *
 diskfs_inode_shard(
     struct diskfs_shared *shared,
     uint64_t              inum)
 {
-    return &shared->inode_cache->shards[inum & DISKFS_INODE_CACHE_MASK];
+    return &shared->inode_cache->shards[diskfs_inum_hash(inum) & DISKFS_INODE_CACHE_MASK];
 } /* diskfs_inode_shard */
 
 static inline uint32_t
 diskfs_inode_bucket(uint64_t inum)
 {
-    return (inum >> 8) & DISKFS_INODE_CACHE_BUCKET_MASK;
+    return (diskfs_inum_hash(inum) >> 8) & DISKFS_INODE_CACHE_BUCKET_MASK;
 } /* diskfs_inode_bucket */
 
 /* Find a resident inode by inum.  In Increment 1 the caller holds the shard
