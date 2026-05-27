@@ -3,6 +3,11 @@
 // SPDX-License-Identifier: LGPL-2.1-only
 
 #define _GNU_SOURCE
+/* Give liburcu the inlined read-side primitives (rcu_read_lock/unlock,
+ * rcu_dereference): without _LGPL_SOURCE they are out-of-line cross-library
+ * calls into liburcu.so, which dominated the NFSv3 read hot path
+ * (diskfs_inode_acquire ~39% CPU = 5 PLT calls/read).  chimera is LGPL-2.1. */
+#define _LGPL_SOURCE
 #include <stdint.h>
 #include <stdlib.h>
 #include <fcntl.h>
