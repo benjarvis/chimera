@@ -1677,7 +1677,7 @@ diskfs_inode_lru_unlink(
 static inline int
 diskfs_inode_idle(const struct diskfs_inode *inode)
 {
-    return inode->refcnt == 1 &&
+    return __atomic_load_n(&inode->refcnt, __ATOMIC_ACQUIRE) == 1 &&
            __atomic_load_n(&inode->lockw, __ATOMIC_ACQUIRE) == 0 &&
            inode->nlink > 0;
 } /* diskfs_inode_idle */
@@ -6442,7 +6442,7 @@ diskfs_inode_free(
      * space map by truncate/deallocate before this point. */
 
     inode->gen++;
-    inode->refcnt = 0;
+    __atomic_store_n(&inode->refcnt, 0, __ATOMIC_RELEASE);
 } /* diskfs_inode_free */
 
 static inline struct diskfs_dirent *
@@ -10005,8 +10005,7 @@ diskfs_remove_at_removed_cb(
     diskfs_map_attrs(thread, &request->remove_at.r_removed_attr, inode);
 
     if (inode->nlink == 0) {
-        --inode->refcnt;
-        if (inode->refcnt == 0) {
+        if (__atomic_sub_fetch(&inode->refcnt, 1, __ATOMIC_ACQ_REL) == 0) {
             struct diskfs_bt_node_hdr *rh;
 
             diskfs_txn_pin_inode_block(thread, p->txn, inode, 0);
@@ -10435,7 +10434,7 @@ diskfs_open_fh_inode_cb(
         return;
     }
 
-    inode->refcnt++;
+    __atomic_fetch_add(&inode->refcnt, 1, __ATOMIC_ACQ_REL);
 
     request->open_fh.r_vfs_private = (uint64_t) inode;
     diskfs_op_ok(request, p->txn);
@@ -10454,7 +10453,12 @@ diskfs_open_fh(
     (void) private_data;
 
     p->thread = thread;
-    p->txn    = diskfs_txn_begin(thread, DISKFS_TXN_WRITE);
+    /* Open-by-FH only pins the inode (atomic refcnt++) and reads its mode; it
+     * mutates nothing, so a SHARED lock suffices.  NFSv3 re-opens on every read,
+     * so a WRITE lock here would serialize all concurrent access to a file --
+     * defeating the lock-free read path.  Concurrent openers bump refcnt
+     * atomically. */
+    p->txn = diskfs_txn_begin(thread, DISKFS_TXN_READ);
 
     diskfs_inode_get_fh_async(thread, p->txn,
                               request->fh, request->fh_len,
@@ -10476,7 +10480,7 @@ diskfs_open_at_finish(
     if (flags & CHIMERA_VFS_OPEN_INFERRED) {
         request->open_at.r_vfs_private = 0xdeadbeefUL;
     } else {
-        inode->refcnt++;
+        __atomic_fetch_add(&inode->refcnt, 1, __ATOMIC_ACQ_REL);
         request->open_at.r_vfs_private = (uint64_t) inode;
     }
 
@@ -10721,7 +10725,7 @@ diskfs_create_unlinked_alloc_cb(
 
     diskfs_apply_attrs(inode, request->create_unlinked.set_attr);
 
-    inode->refcnt++;
+    __atomic_fetch_add(&inode->refcnt, 1, __ATOMIC_ACQ_REL);
     request->create_unlinked.r_vfs_private = (uint64_t) inode;
 
     diskfs_map_attrs(thread, &request->create_unlinked.r_attr, inode);
@@ -10762,8 +10766,7 @@ diskfs_close_inode_cb(
         return;
     }
 
-    --inode->refcnt;
-    if (inode->refcnt == 0) {
+    if (__atomic_sub_fetch(&inode->refcnt, 1, __ATOMIC_ACQ_REL) == 0) {
         diskfs_inode_free(p->thread, inode);
     }
 
