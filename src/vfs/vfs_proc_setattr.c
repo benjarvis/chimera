@@ -8,6 +8,7 @@
 #include "vfs_state.h"
 #include "vfs_internal.h"
 #include "vfs_attr_cache.h"
+#include "vfs_grant_cache.h"
 #include "vfs_access.h"
 #include "vfs_acl.h"
 #include "common/misc.h"
@@ -83,6 +84,18 @@ chimera_vfs_setattr_complete(struct chimera_vfs_request *request)
                                       request->fh,
                                       request->fh_len,
                                       &request->setattr.r_post_attr);
+
+        /* A change to mode/owner/ACL alters every caller's effective rights on
+         * this file; drop its cached grants so the next gated I/O re-evaluates
+         * against the new security attributes. */
+        if (request->setattr.set_attr->va_set_mask &
+            (CHIMERA_VFS_ATTR_MODE | CHIMERA_VFS_ATTR_ACL |
+             CHIMERA_VFS_ATTR_UID | CHIMERA_VFS_ATTR_GID)) {
+            chimera_vfs_grant_cache_invalidate_fh(thread->vfs->vfs_grant_cache,
+                                                  request->fh_hash,
+                                                  request->fh,
+                                                  request->fh_len);
+        }
     }
 
     chimera_vfs_complete(request);

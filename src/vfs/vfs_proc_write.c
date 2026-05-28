@@ -8,8 +8,10 @@
 #include "vfs_internal.h"
 #include "vfs_open_cache.h"
 #include "vfs_attr_cache.h"
+#include "vfs_grant_cache.h"
 #include "vfs_access.h"
 #include "vfs_acl.h"
+#include "vfs_cred.h"
 #include "common/macros.h"
 
 static void
@@ -122,6 +124,14 @@ chimera_vfs_write_gate_complete(
                                                             CHIMERA_ACE_MASK_ALL);
     gate->handle->granted_valid = 1;
 
+    /* Publish the freshly computed grant to the shared cache so other handles
+     * (notably per-op synthetic NFSv3 handles) reuse it without a getattr. */
+    chimera_vfs_grant_cache_insert(gate->thread->vfs->vfs_grant_cache,
+                                   gate->handle->fh_hash, gate->handle->fh,
+                                   gate->handle->fh_len,
+                                   chimera_vfs_cred_hash(gate->cred),
+                                   gate->handle->granted_access);
+
     if (!(gate->handle->granted_access & CHIMERA_ACE_WRITE_DATA)) {
         gate->callback(CHIMERA_VFS_EACCES, 0, 0, NULL, NULL, gate->private_data);
         free(gate);
@@ -153,8 +163,20 @@ chimera_vfs_write_owned(
     void                                 *private_data)
 {
     struct chimera_vfs_write_gate *gate;
+    uint32_t                       granted;
 
     if (chimera_vfs_gate_needed(handle->vfs_module->capabilities, cred)) {
+        if (!handle->granted_valid &&
+            chimera_vfs_grant_cache_lookup(thread->vfs->vfs_grant_cache,
+                                           handle->fh_hash, handle->fh,
+                                           handle->fh_len,
+                                           chimera_vfs_cred_hash(cred),
+                                           &granted) == 0) {
+            /* Shared-cache hit: promote onto the handle. */
+            handle->granted_access = granted;
+            handle->granted_valid  = 1;
+        }
+
         if (handle->granted_valid) {
             if (!(handle->granted_access & CHIMERA_ACE_WRITE_DATA)) {
                 callback(CHIMERA_VFS_EACCES, 0, 0, NULL, NULL, private_data);

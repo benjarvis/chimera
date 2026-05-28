@@ -23,6 +23,7 @@ struct evpl;
 struct chimera_vfs;
 struct chimera_vfs_user;
 struct chimera_vfs_user_cache;
+struct chimera_vfs_grant_cache;
 struct prometheus_metrics;
 
 /* FSSTAT values used with builtin backends until statvfs tracking is implemented */
@@ -1262,6 +1263,7 @@ struct chimera_vfs {
     struct vfs_open_cache                *vfs_open_file_cache;
     struct chimera_vfs_name_cache        *vfs_name_cache;
     struct chimera_vfs_attr_cache        *vfs_attr_cache;
+    struct chimera_vfs_grant_cache       *vfs_grant_cache;
     struct chimera_vfs_user_cache        *vfs_user_cache;
     struct chimera_vfs_identity          *identity;
     struct chimera_vfs_notify            *vfs_notify;

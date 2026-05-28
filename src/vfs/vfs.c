@@ -20,6 +20,7 @@
 #include "vfs/vfs_dump.h"
 #include "vfs/vfs_name_cache.h"
 #include "vfs/vfs_attr_cache.h"
+#include "vfs/vfs_grant_cache.h"
 #include "vfs/vfs_user_cache.h"
 #include "vfs/vfs_identity.h"
 #include "vfs/vfs_notify.h"
@@ -449,6 +450,11 @@ chimera_vfs_init(
     vfs->vfs_name_cache = chimera_vfs_name_cache_create(8, 4, 2, cache_ttl, metrics);
     vfs->vfs_attr_cache = chimera_vfs_attr_cache_create(8, 4, 2, cache_ttl, metrics);
 
+    /* Engine-backend access-grant cache: keyed by (fh, cred); slot indexed by fh
+     * so a file's grants invalidate together.  Bounded by the same TTL as the
+     * attr cache so a grant never outlives the attrs it was derived from. */
+    vfs->vfs_grant_cache = chimera_vfs_grant_cache_create(8, 4, 2, cache_ttl, metrics);
+
     vfs->vfs_user_cache = chimera_vfs_user_cache_create(8192, 600);
     vfs->identity       = chimera_vfs_identity_create(vfs, 4);
 
@@ -638,6 +644,10 @@ chimera_vfs_destroy(struct chimera_vfs *vfs)
 
     if (vfs->vfs_attr_cache) {
         chimera_vfs_attr_cache_destroy(vfs->vfs_attr_cache);
+    }
+
+    if (vfs->vfs_grant_cache) {
+        chimera_vfs_grant_cache_destroy(vfs->vfs_grant_cache);
     }
 
     chimera_vfs_open_cache_destroy(vfs->vfs_open_path_cache);
