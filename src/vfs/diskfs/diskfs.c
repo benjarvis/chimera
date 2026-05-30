@@ -537,8 +537,8 @@ struct diskfs_block_waiter;
 struct diskfs_block {
     uint32_t                    device_id;
     uint64_t                    device_offset; /* block-aligned; key with device_id */
-    struct evpl_iovec           iov;           /* SHARED DISKFS_BLOCK_SIZE buffer; .data may
-                                                * be NULL on a never-yet-used pool slot */
+    struct evpl_iovec           iov;           /* SHARED DISKFS_BLOCK_SIZE buffer, preallocated
+                                                * at cache create and recycled within diskfs */
     int                         pin_count;     /* >0 => pinned, not reclaimable */
     enum diskfs_block_state state;
     uint64_t                    seq;           /* update order for tail-push */
@@ -560,7 +560,7 @@ struct diskfs_block_shard {
 
     /* Pre-allocated fixed pool of block structs (all protected by lock); the
      * structs are never individually freed.  Each struct's buffer is a SHARED
-     * evpl iovec allocated lazily on first use and reused across recyclings
+     * evpl iovec preallocated at cache create and reused across recyclings
      * (released only at teardown).  The LRU holds only CLEAN, unpinned buffers
      * (recycle candidates), ordered least-recently-used first. */
     struct diskfs_block  *pool;                 /* [nblocks] */
@@ -2385,6 +2385,7 @@ diskfs_block_cache_create(struct diskfs_shared *shared)
         shared->block_cache_blocks : DISKFS_BLOCK_CACHE_DEFAULT_BLOCKS;
     int                        i;
     uint32_t                   j;
+    struct evpl               *evpl;
 
     /* The pool never grows or blocks, so it must clear the maximum pinnable
      * set; floor an under-sized configuration rather than risk the recycle
@@ -2398,6 +2399,20 @@ diskfs_block_cache_create(struct diskfs_shared *shared)
         cache->shard_cap = 1;
     }
 
+    /* Preallocate every block buffer up front from a dedicated, short-lived
+     * evpl so the whole cache working set is carved before any worker thread
+     * does a runtime SHARED allocation.  Each evpl fills its own SHARED slab
+     * buffers, so this packs the long-lived 4 KiB metadata pages into buffers
+     * that contain *only* block-cache pages; once this evpl is destroyed those
+     * buffers stay pinned (refcounted by the cache iovecs), and workers later
+     * carve their short-lived transport/journal SHARED iovecs from fresh
+     * buffers.  That keeps long-lived cache pages and transient iovecs out of
+     * the same 2 MiB buffer -- the fragmentation that otherwise lets one cached
+     * page hold a whole buffer resident.  The buffers are recycled entirely
+     * within diskfs thereafter (a CLEAN block keeps its iovec across LRU
+     * recyclings); they return to libevpl only at teardown. */
+    evpl = evpl_create(NULL);
+
     for (i = 0; i < DISKFS_BLOCK_CACHE_SHARDS; i++) {
         struct diskfs_block_shard *shard = &cache->shards[i];
 
@@ -2407,16 +2422,21 @@ diskfs_block_cache_create(struct diskfs_shared *shared)
         shard->pool = calloc(cache->shard_cap, sizeof(struct diskfs_block));
 
         /* Pre-populate the struct pool: every block starts free (unkeyed, in
-         * no bucket) and CLEAN on the LRU, with no buffer yet (iov.data NULL);
-         * the iovec is allocated on first use and reused thereafter. */
+         * no bucket) and CLEAN on the LRU, with its SHARED buffer already
+         * allocated and reused thereafter. */
         for (j = 0; j < cache->shard_cap; j++) {
             struct diskfs_block *blk = &shard->pool[j];
 
             blk->state = DISKFS_BLOCK_CLEAN;
+            evpl_iovec_alloc(evpl, DISKFS_BLOCK_SIZE, DISKFS_BLOCK_SIZE, 1,
+                             EVPL_IOVEC_FLAG_SHARED, &blk->iov);
             diskfs_block_lru_push_tail(shard, blk);
             shard->nblocks++;
         }
     }
+
+    evpl_destroy(evpl);
+
     shared->block_cache = cache;
 } /* diskfs_block_cache_create */
 
@@ -2475,9 +2495,11 @@ diskfs_block_lookup_locked(
 /*
  * Ensure a block has a backing buffer.  Buffers are SHARED evpl iovecs so the
  * intent logger and tail-pusher can reference them zero-copy for I/O (and RDMA)
- * and hand the reference across threads.  A recycled block keeps (reuses) its
- * iovec -- a CLEAN block's buffer is referenced only by the cache (refcount 1)
- * -- so an allocation happens only on a never-yet-used pool slot (and on COW).
+ * and hand the reference across threads.  Every pool slot's buffer is now
+ * preallocated at cache create and a recycled block keeps (reuses) its iovec,
+ * so this is a defensive no-op on the steady-state cache; the only runtime
+ * allocation is the COW fork below (write path, when a block is mutated while
+ * its prior image is still riding an un-pushed redo record).
  */
 static inline void
 diskfs_block_ensure_iov(
