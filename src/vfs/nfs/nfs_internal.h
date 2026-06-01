@@ -225,7 +225,7 @@ chimera_nfs_thread_get_server_thread(
     /* Server index is at position CHIMERA_VFS_MOUNT_ID_SIZE (first byte of fh_fragment) */
     index = fh[CHIMERA_VFS_MOUNT_ID_SIZE];
 
-    if (unlikely(index > thread->shared->max_servers)) {
+    if (unlikely(index >= thread->shared->max_servers)) {
         return NULL;
     }
 

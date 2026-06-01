@@ -164,7 +164,10 @@ chimera_nfs_notify(
     struct evpl_rpc2_notify *notify,
     void                    *private_data)
 {
-    char local_addr[80], remote_addr[80];
+    char                                     local_addr[80], remote_addr[80];
+    struct chimera_nfs_thread               *nfs_thread;
+    struct chimera_nfs_client_server_thread *server_thread;
+    int                                      i;
 
     switch (notify->notify_type) {
         case EVPL_RPC2_NOTIFY_CONNECTED:
@@ -176,6 +179,37 @@ chimera_nfs_notify(
             evpl_rpc2_conn_get_local_address(conn, local_addr, sizeof(local_addr));
             evpl_rpc2_conn_get_remote_address(conn, remote_addr, sizeof(remote_addr));
             chimera_nfsclient_info("Disconnected from %s to %s", local_addr, remote_addr);
+
+            /*
+             * rpc2 frees this conn once we return, so drop any cached
+             * reference to it.  The next operation that needs the server will
+             * lazily reconnect via chimera_nfs_thread_get_server_thread.  In-
+             * flight calls on this conn are error-completed by the rpc2 layer
+             * before this notify fires, so callers see a transport error rather
+             * than hanging.  Single evpl thread -> no locking.
+             */
+            nfs_thread = private_data;
+
+            for (i = 0; i < nfs_thread->max_server_threads; i++) {
+                server_thread = nfs_thread->server_threads[i];
+
+                if (!server_thread) {
+                    continue;
+                }
+
+                if (server_thread->nfs_conn == conn) {
+                    server_thread->nfs_conn = NULL;
+                }
+                if (server_thread->nlm_conn == conn) {
+                    server_thread->nlm_conn = NULL;
+                }
+                if (server_thread->mount_conn == conn) {
+                    server_thread->mount_conn = NULL;
+                }
+                if (server_thread->portmap_conn == conn) {
+                    server_thread->portmap_conn = NULL;
+                }
+            }
             break;
     } /* switch */
 } /* chimera_nfs_notify */
