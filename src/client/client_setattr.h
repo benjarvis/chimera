@@ -100,7 +100,7 @@ chimera_setattr_lookup_complete(
 
     chimera_vfs_open_fh(
         request->thread->vfs_thread,
-        &request->thread->client->cred,
+        &request->thread->client->cred, NULL,
         request->fh,
         request->fh_len,
         open_flags,
@@ -115,7 +115,7 @@ chimera_dispatch_setattr(
 {
     chimera_vfs_lookup(
         thread->vfs_thread,
-        &thread->client->cred,
+        &thread->client->cred, NULL,
         thread->client->root_fh,
         thread->client->root_fh_len,
         request->setattr.path,

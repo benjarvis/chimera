@@ -345,7 +345,7 @@ chimera_s3_multipart_part_destroy_async(
 
     chimera_vfs_open_fh(
         thread->vfs,
-        &thread->shared->cred,
+        &thread->shared->cred, NULL,
         part->dir_fh,
         part->dir_fhlen,
         CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_INFERRED |
@@ -696,7 +696,7 @@ chimera_s3_upload_part_recv(
 
     request->io_pending++;
 
-    chimera_vfs_write(thread->vfs, &thread->shared->cred,
+    chimera_vfs_write(thread->vfs, &thread->shared->cred, NULL,
                       request->file_handle,
                       request->file_cur_offset,
                       avail,
@@ -800,7 +800,7 @@ chimera_s3_upload_part_open_dir_callback(
         request->multipart.tmp_name_len = 0;
 
         chimera_vfs_create_unlinked(
-            thread->vfs, &thread->shared->cred,
+            thread->vfs, &thread->shared->cred, NULL,
             oh->fh,
             oh->fh_len,
             &request->set_attr,
@@ -816,7 +816,7 @@ chimera_s3_upload_part_open_dir_callback(
             request->multipart.part_number);
 
         chimera_vfs_open_at(
-            thread->vfs, &thread->shared->cred,
+            thread->vfs, &thread->shared->cred, NULL,
             oh,
             request->multipart.tmp_name,
             request->multipart.tmp_name_len,
@@ -848,7 +848,7 @@ chimera_s3_upload_part_lookup_callback(
     }
 
     chimera_vfs_open_fh(
-        thread->vfs, &thread->shared->cred,
+        thread->vfs, &thread->shared->cred, NULL,
         attr->va_fh,
         attr->va_fh_len,
         CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_INFERRED |
@@ -918,7 +918,7 @@ chimera_s3_upload_part(
     /* Use chimera_vfs_create so the parent directory chain is materialized
      * lazily (mirrors PUT behavior). */
     chimera_vfs_create(
-        thread->vfs, &thread->shared->cred,
+        thread->vfs, &thread->shared->cred, NULL,
         request->bucket_fh,
         request->bucket_fhlen,
         dirpath,
@@ -1418,7 +1418,7 @@ chimera_s3_complete_rw_read_callback(
     ctx->rw_niov = niov;
 
     chimera_vfs_write(
-        thread->vfs, &thread->shared->cred,
+        thread->vfs, &thread->shared->cred, NULL,
         request->file_handle,
         ctx->write_offset,
         count,
@@ -1452,7 +1452,7 @@ chimera_s3_complete_assemble_rw(struct chimera_s3_complete_ctx *ctx)
     ctx->rw_niov = CHIMERA_S3_IOV_MAX;
 
     chimera_vfs_read(
-        thread->vfs, &thread->shared->cred,
+        thread->vfs, &thread->shared->cred, NULL,
         part->file_handle,
         ctx->part_offset,
         chunk,
@@ -1601,7 +1601,7 @@ chimera_s3_complete_finalize(struct chimera_s3_complete_ctx *ctx)
     if (request->multipart.tmp_name_len) {
         chimera_vfs_rename_at(
             thread->vfs,
-            &thread->shared->cred,
+            &thread->shared->cred, NULL,
             request->dir_handle->fh,
             request->dir_handle->fh_len,
             request->multipart.tmp_name,
@@ -1619,7 +1619,7 @@ chimera_s3_complete_finalize(struct chimera_s3_complete_ctx *ctx)
     } else {
         chimera_vfs_link_at(
             thread->vfs,
-            &thread->shared->cred,
+            &thread->shared->cred, NULL,
             request->file_handle->fh,
             request->file_handle->fh_len,
             request->dir_handle->fh,
@@ -1734,7 +1734,7 @@ chimera_s3_complete_open_dir_callback(
         request->multipart.tmp_name_len = 0;
 
         chimera_vfs_create_unlinked(
-            thread->vfs, &thread->shared->cred,
+            thread->vfs, &thread->shared->cred, NULL,
             oh->fh,
             oh->fh_len,
             &request->set_attr,
@@ -1750,7 +1750,7 @@ chimera_s3_complete_open_dir_callback(
             (uint64_t) request->start_time.tv_nsec);
 
         chimera_vfs_open_at(
-            thread->vfs, &thread->shared->cred,
+            thread->vfs, &thread->shared->cred, NULL,
             oh,
             request->multipart.tmp_name,
             request->multipart.tmp_name_len,
@@ -1779,7 +1779,7 @@ chimera_s3_complete_create_root_callback(
     }
 
     chimera_vfs_open_fh(
-        thread->vfs, &thread->shared->cred,
+        thread->vfs, &thread->shared->cred, NULL,
         attr->va_fh,
         attr->va_fh_len,
         CHIMERA_VFS_OPEN_PATH | CHIMERA_VFS_OPEN_INFERRED |
@@ -1941,7 +1941,7 @@ chimera_s3_complete_multipart_upload_body_done(
     request->name_len = strlen(request->name);
 
     chimera_vfs_create(
-        thread->vfs, &thread->shared->cred,
+        thread->vfs, &thread->shared->cred, NULL,
         request->bucket_fh,
         request->bucket_fhlen,
         dirpath,

@@ -239,7 +239,7 @@ chimera_s3_list(
 
         chimera_vfs_lookup(
             thread->vfs,
-            &thread->shared->cred,
+            &thread->shared->cred, NULL,
             request->bucket_fh,
             request->bucket_fhlen,
             request->path,

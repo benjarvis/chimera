@@ -45,6 +45,7 @@ static void
 chimera_vfs_write_dispatch(
     struct chimera_vfs_thread            *thread,
     const struct chimera_vfs_cred        *cred,
+    struct chimera_vfs_transaction       *txn,
     struct chimera_vfs_open_handle       *handle,
     uint64_t                              offset,
     uint32_t                              count,
@@ -65,6 +66,8 @@ chimera_vfs_write_dispatch(
         callback(CHIMERA_VFS_PTR_ERR(request), 0, 0, NULL, NULL, private_data);
         return;
     }
+
+    request->transaction = txn;
 
     request->opcode       = CHIMERA_VFS_OP_WRITE;
     request->complete     = chimera_vfs_write_complete;
@@ -93,6 +96,7 @@ chimera_vfs_write_dispatch(
 struct chimera_vfs_write_gate {
     struct chimera_vfs_thread            *thread;
     const struct chimera_vfs_cred        *cred;
+    struct chimera_vfs_transaction       *txn;
     struct chimera_vfs_open_handle       *handle;
     uint64_t                              offset;
     uint32_t                              count;
@@ -130,7 +134,7 @@ chimera_vfs_write_gate_complete(
         return;
     }
 
-    chimera_vfs_write_dispatch(gate->thread, gate->cred, gate->handle,
+    chimera_vfs_write_dispatch(gate->thread, gate->cred, gate->txn, gate->handle,
                                gate->offset, gate->count, gate->sync,
                                gate->pre_attr_mask, gate->post_attr_mask,
                                gate->iov, gate->niov, gate->io_owner,
@@ -142,6 +146,7 @@ SYMBOL_EXPORT void
 chimera_vfs_write_owned(
     struct chimera_vfs_thread            *thread,
     const struct chimera_vfs_cred        *cred,
+    struct chimera_vfs_transaction       *txn,
     struct chimera_vfs_open_handle       *handle,
     uint64_t                              offset,
     uint32_t                              count,
@@ -167,6 +172,7 @@ chimera_vfs_write_owned(
 
             gate->thread         = thread;
             gate->cred           = cred;
+            gate->txn            = txn;
             gate->handle         = handle;
             gate->offset         = offset;
             gate->count          = count;
@@ -186,7 +192,7 @@ chimera_vfs_write_owned(
         }
     }
 
-    chimera_vfs_write_dispatch(thread, cred, handle, offset, count, sync,
+    chimera_vfs_write_dispatch(thread, cred, txn, handle, offset, count, sync,
                                pre_attr_mask, post_attr_mask, iov, niov,
                                io_owner, callback, private_data);
 } /* chimera_vfs_write_owned */
@@ -195,6 +201,7 @@ SYMBOL_EXPORT void
 chimera_vfs_write(
     struct chimera_vfs_thread      *thread,
     const struct chimera_vfs_cred  *cred,
+    struct chimera_vfs_transaction *txn,
     struct chimera_vfs_open_handle *handle,
     uint64_t                        offset,
     uint32_t                        count,
@@ -206,7 +213,7 @@ chimera_vfs_write(
     chimera_vfs_write_callback_t    callback,
     void                           *private_data)
 {
-    chimera_vfs_write_owned(thread, cred, handle, offset, count, sync,
+    chimera_vfs_write_owned(thread, cred, txn, handle, offset, count, sync,
                             pre_attr_mask, post_attr_mask, iov, niov,
                             NULL, callback, private_data);
 } /* chimera_vfs_write */

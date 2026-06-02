@@ -94,7 +94,7 @@ chimera_posix_fchmodat_at_exec(
     /* Open the target file relative to the parent directory */
     chimera_vfs_open_at(
         thread->vfs_thread,
-        &thread->client->cred,
+        &thread->client->cred, NULL,
         request->setattr.parent_handle,
         request->setattr.path,
         request->setattr.path_len,

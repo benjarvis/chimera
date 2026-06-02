@@ -180,6 +180,7 @@ static void
 chimera_vfs_read_dispatch(
     struct chimera_vfs_thread            *thread,
     const struct chimera_vfs_cred        *cred,
+    struct chimera_vfs_transaction       *txn,
     struct chimera_vfs_open_handle       *handle,
     uint64_t                              offset,
     uint32_t                              count,
@@ -200,6 +201,8 @@ chimera_vfs_read_dispatch(
         callback(CHIMERA_VFS_PTR_ERR(request), 0, 0, NULL, 0, NULL, private_data);
         return;
     }
+
+    request->transaction = txn;
 
     request->opcode      = CHIMERA_VFS_OP_READ;
     request->complete    = chimera_vfs_read_complete;
@@ -260,6 +263,7 @@ chimera_vfs_read_dispatch(
 struct chimera_vfs_read_gate {
     struct chimera_vfs_thread            *thread;
     const struct chimera_vfs_cred        *cred;
+    struct chimera_vfs_transaction       *txn;
     struct chimera_vfs_open_handle       *handle;
     uint64_t                              offset;
     uint32_t                              count;
@@ -297,7 +301,7 @@ chimera_vfs_read_gate_complete(
         return;
     }
 
-    chimera_vfs_read_dispatch(gate->thread, gate->cred, gate->handle,
+    chimera_vfs_read_dispatch(gate->thread, gate->cred, gate->txn, gate->handle,
                               gate->offset, gate->count, gate->iov, gate->niov,
                               gate->dest_iov, gate->dest_niov,
                               gate->attr_mask, gate->io_owner, gate->callback,
@@ -312,6 +316,7 @@ static void
 chimera_vfs_read_submit(
     struct chimera_vfs_thread            *thread,
     const struct chimera_vfs_cred        *cred,
+    struct chimera_vfs_transaction       *txn,
     struct chimera_vfs_open_handle       *handle,
     uint64_t                              offset,
     uint32_t                              count,
@@ -339,6 +344,7 @@ chimera_vfs_read_submit(
 
             gate->thread       = thread;
             gate->cred         = cred;
+            gate->txn          = txn;
             gate->handle       = handle;
             gate->offset       = offset;
             gate->count        = count;
@@ -358,7 +364,7 @@ chimera_vfs_read_submit(
         }
     }
 
-    chimera_vfs_read_dispatch(thread, cred, handle, offset, count, iov, niov,
+    chimera_vfs_read_dispatch(thread, cred, txn, handle, offset, count, iov, niov,
                               dest_iov, dest_niov, attr_mask, io_owner, callback,
                               private_data);
 } /* chimera_vfs_read_submit */
@@ -367,6 +373,7 @@ SYMBOL_EXPORT void
 chimera_vfs_read_owned(
     struct chimera_vfs_thread            *thread,
     const struct chimera_vfs_cred        *cred,
+    struct chimera_vfs_transaction       *txn,
     struct chimera_vfs_open_handle       *handle,
     uint64_t                              offset,
     uint32_t                              count,
@@ -377,7 +384,7 @@ chimera_vfs_read_owned(
     chimera_vfs_read_callback_t           callback,
     void                                 *private_data)
 {
-    chimera_vfs_read_submit(thread, cred, handle, offset, count, iov, niov,
+    chimera_vfs_read_submit(thread, cred, txn, handle, offset, count, iov, niov,
                             NULL, 0, attr_mask, io_owner, callback, private_data);
 } /* chimera_vfs_read_owned */
 
@@ -385,6 +392,7 @@ SYMBOL_EXPORT void
 chimera_vfs_read(
     struct chimera_vfs_thread      *thread,
     const struct chimera_vfs_cred  *cred,
+    struct chimera_vfs_transaction *txn,
     struct chimera_vfs_open_handle *handle,
     uint64_t                        offset,
     uint32_t                        count,
@@ -394,7 +402,7 @@ chimera_vfs_read(
     chimera_vfs_read_callback_t     callback,
     void                           *private_data)
 {
-    chimera_vfs_read_submit(thread, cred, handle, offset, count, iov, niov,
+    chimera_vfs_read_submit(thread, cred, txn, handle, offset, count, iov, niov,
                             NULL, 0, attr_mask, NULL, callback, private_data);
 } /* chimera_vfs_read */
 
@@ -413,7 +421,7 @@ chimera_vfs_read_into(
     chimera_vfs_read_callback_t     callback,
     void                           *private_data)
 {
-    chimera_vfs_read_submit(thread, cred, handle, offset, count,
+    chimera_vfs_read_submit(thread, cred, NULL, handle, offset, count,
                             work_iov, work_niov, dest_iov, dest_niov,
                             attr_mask, NULL, callback, private_data);
 } /* chimera_vfs_read_into */

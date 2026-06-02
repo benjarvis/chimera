@@ -653,7 +653,7 @@ s3_server_dispatch(
     }
 
     chimera_vfs_lookup(thread->vfs,
-                       &thread->shared->cred,
+                       &thread->shared->cred, NULL,
                        shared->root_fh,
                        shared->root_fh_len,
                        bucket->path,

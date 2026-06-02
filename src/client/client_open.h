@@ -80,7 +80,7 @@ chimera_dispatch_open_at(
 
     chimera_vfs_open_at(
         thread->vfs_thread,
-        &thread->client->cred,
+        &thread->client->cred, NULL,
         parent_handle,
         request->open.path,
         request->open.path_len,
