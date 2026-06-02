@@ -34,7 +34,7 @@ chimera_dispatch_fsetattr(
 {
     chimera_vfs_setattr(
         thread->vfs_thread,
-        &thread->client->cred,
+        &thread->client->cred, NULL,
         request->fsetattr.handle,
         &request->fsetattr.set_attr,
         0,  /* pre_attr_mask */

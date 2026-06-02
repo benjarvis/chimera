@@ -38,7 +38,7 @@ chimera_dispatch_fstat(
 {
     chimera_vfs_getattr(
         thread->vfs_thread,
-        &thread->client->cred,
+        &thread->client->cred, NULL,
         request->fstat.handle,
         CHIMERA_VFS_ATTR_MASK_STAT,
         chimera_fstat_getattr_complete,

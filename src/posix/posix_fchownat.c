@@ -75,7 +75,7 @@ chimera_posix_fchownat_open_complete(
 
     chimera_vfs_setattr(
         request->thread->vfs_thread,
-        &request->thread->client->cred,
+        &request->thread->client->cred, NULL,
         oh,
         &ctx->set_attr,
         0,  /* pre_attr_mask */

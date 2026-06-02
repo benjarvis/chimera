@@ -57,7 +57,7 @@ chimera_setattr_open_complete(
 
     chimera_vfs_setattr(
         request->thread->vfs_thread,
-        &request->thread->client->cred,
+        &request->thread->client->cred, NULL,
         oh,
         &request->setattr.set_attr,
         0,  /* pre_attr_mask */
@@ -157,7 +157,7 @@ chimera_dispatch_setattr_at(
 {
     chimera_vfs_setattr(
         thread->vfs_thread,
-        &thread->client->cred,
+        &thread->client->cred, NULL,
         parent_handle,
         &request->setattr.set_attr,
         0,  /* pre_attr_mask */

@@ -95,7 +95,7 @@ chimera_remove_at_lookup_complete(
     /* Now call remove with the child FH */
     chimera_vfs_remove_at(
         thread->vfs_thread,
-        &thread->client->cred,
+        &thread->client->cred, NULL,
         request->remove.parent_handle,
         request->remove.path,
         request->remove.path_len,

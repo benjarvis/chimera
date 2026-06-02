@@ -87,7 +87,7 @@ chimera_statfs_open_complete(
 
     chimera_vfs_getattr(
         request->thread->vfs_thread,
-        &request->thread->client->cred,
+        &request->thread->client->cred, NULL,
         oh,
         CHIMERA_VFS_ATTR_MASK_STATFS,
         chimera_statfs_getattr_complete,

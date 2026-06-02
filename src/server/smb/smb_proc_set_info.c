@@ -196,7 +196,7 @@ chimera_smb_set_info_allocation_getattr_callback(
 
     chimera_vfs_setattr(
         request->compound->thread->vfs_thread,
-        &request->session_handle->session->cred,
+        &request->session_handle->session->cred, NULL,
         request->set_info.open_file->handle,
         &request->set_info.vfs_attrs,
         0,
@@ -232,7 +232,7 @@ chimera_smb_set_info(struct chimera_smb_request *request)
 
                     chimera_vfs_setattr(
                         request->compound->thread->vfs_thread,
-                        &request->session_handle->session->cred,
+                        &request->session_handle->session->cred, NULL,
                         request->set_info.open_file->handle,
                         &request->set_info.vfs_attrs,
                         0,
@@ -254,7 +254,7 @@ chimera_smb_set_info(struct chimera_smb_request *request)
 
                     chimera_vfs_setattr(
                         request->compound->thread->vfs_thread,
-                        &request->session_handle->session->cred,
+                        &request->session_handle->session->cred, NULL,
                         request->set_info.open_file->handle,
                         &request->set_info.vfs_attrs,
                         0,
@@ -273,7 +273,7 @@ chimera_smb_set_info(struct chimera_smb_request *request)
 
                     chimera_vfs_getattr(
                         request->compound->thread->vfs_thread,
-                        &request->session_handle->session->cred,
+                        &request->session_handle->session->cred, NULL,
                         request->set_info.open_file->handle,
                         CHIMERA_VFS_ATTR_SIZE,
                         chimera_smb_set_info_allocation_getattr_callback,
