@@ -135,21 +135,72 @@ chimera_s3_get_open_callback(
 
 } /* chimera_s3_put_create_callback */
 
+/* Bound on metadata-phase transaction conflict replays before failing. */
+#define CHIMERA_S3_TXN_MAX_RETRIES 8
+
+static void chimera_s3_get_begin(
+    struct chimera_s3_request *request);
+
+/* Final failure path: respond NoSuchKey. */
 static void
-chimera_s3_get_lookup_callback(
-    enum chimera_vfs_error    error_code,
-    struct chimera_vfs_attrs *attr,
-    void                     *private_data)
+chimera_s3_get_fail(struct chimera_s3_request *request)
+{
+    struct chimera_server_s3_thread *thread = request->thread;
+
+    request->status    = CHIMERA_S3_STATUS_NO_SUCH_KEY;
+    request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
+    if (request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
+        s3_server_respond(thread->evpl, request);
+    }
+} /* chimera_s3_get_fail */
+
+/* EndTransaction(ABORT) completion after a wait-die conflict during the lookup:
+ * replay the whole metadata phase (reusing the stable txn_ts), or give up. */
+static void
+chimera_s3_get_conflict_done(
+    enum chimera_vfs_error error_code,
+    void                  *private_data)
+{
+    struct chimera_s3_request *request = private_data;
+
+    (void) error_code;
+
+    if (++request->txn_attempt > CHIMERA_S3_TXN_MAX_RETRIES) {
+        chimera_s3_get_fail(request);
+        return;
+    }
+    chimera_s3_get_begin(request);
+} /* chimera_s3_get_conflict_done */
+
+/* EndTransaction(ABORT) completion after a real lookup failure (NoSuchKey). */
+static void
+chimera_s3_get_notfound_done(
+    enum chimera_vfs_error error_code,
+    void                  *private_data)
+{
+    (void) error_code;
+    chimera_s3_get_fail(private_data);
+} /* chimera_s3_get_notfound_done */
+
+/* EndTransaction(COMMIT) completion: the metadata view is now consistent and
+ * released.  Everything from here (headers, open, data) is autocommit -- so once
+ * we emit output we never replay.  Uses the saved lookup attrs (request->txn_attr)
+ * since the VFS attr pointer did not survive the async EndTransaction. */
+static void
+chimera_s3_get_committed(
+    enum chimera_vfs_error error_code,
+    void                  *private_data)
 {
     struct chimera_s3_request       *request = private_data;
     struct chimera_server_s3_thread *thread  = request->thread;
     struct evpl                     *evpl    = thread->evpl;
+    struct chimera_vfs_attrs        *attr    = &request->txn_attr;
 
-    if (error_code) {
-        request->status    = CHIMERA_S3_STATUS_NO_SUCH_KEY;
-        request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
-        if (request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
-            s3_server_respond(evpl, request);
+    if (error_code == CHIMERA_VFS_ETXN_CONFLICT) {
+        if (++request->txn_attempt > CHIMERA_S3_TXN_MAX_RETRIES) {
+            chimera_s3_get_fail(request);
+        } else {
+            chimera_s3_get_begin(request);
         }
         return;
     }
@@ -164,8 +215,6 @@ chimera_s3_get_lookup_callback(
         request->file_left   = request->file_length;
     }
 
-    chimera_s3_abort_if(!(attr->va_set_mask & CHIMERA_VFS_ATTR_FH), "put lookup callback: no fh");
-
     if (request->http_state == CHIMERA_S3_HTTP_STATE_RECVED) {
         s3_server_respond(evpl, request);
     }
@@ -173,6 +222,8 @@ chimera_s3_get_lookup_callback(
     if (evpl_http_request_type(request->http_request) == EVPL_HTTP_REQUEST_TYPE_HEAD) {
         request->vfs_state = CHIMERA_S3_VFS_STATE_COMPLETE;
     } else {
+        /* Data phase runs autocommit (NULL txn): the object content streams to
+         * the client and cannot be replayed. */
         chimera_vfs_open_fh(thread->vfs, &thread->shared->cred, NULL,
                             attr->va_fh,
                             attr->va_fh_len,
@@ -180,17 +231,58 @@ chimera_s3_get_lookup_callback(
                             chimera_s3_get_open_callback,
                             request);
     }
+} /* chimera_s3_get_committed */
+
+static void
+chimera_s3_get_lookup_callback(
+    enum chimera_vfs_error    error_code,
+    struct chimera_vfs_attrs *attr,
+    void                     *private_data)
+{
+    struct chimera_s3_request       *request = private_data;
+    struct chimera_server_s3_thread *thread  = request->thread;
+
+    if (error_code == CHIMERA_VFS_ETXN_CONFLICT) {
+        chimera_vfs_end_transaction(thread->vfs, &thread->shared->cred,
+                                    request->txn, CHIMERA_VFS_TXN_ABORT,
+                                    chimera_s3_get_conflict_done, request);
+        return;
+    }
+
+    if (error_code) {
+        chimera_vfs_end_transaction(thread->vfs, &thread->shared->cred,
+                                    request->txn, CHIMERA_VFS_TXN_ABORT,
+                                    chimera_s3_get_notfound_done, request);
+        return;
+    }
+
+    chimera_s3_abort_if(!(attr->va_set_mask & CHIMERA_VFS_ATTR_FH), "get lookup callback: no fh");
+
+    /* Preserve the lookup result across the async commit. */
+    request->txn_attr = *attr;
+
+    chimera_vfs_end_transaction(thread->vfs, &thread->shared->cred,
+                                request->txn, CHIMERA_VFS_TXN_COMMIT_ASYNC,
+                                chimera_s3_get_committed, request);
 }  /* chimera_s3_get_lookup_callback */
 
-void
-chimera_s3_get(
-    struct evpl                     *evpl,
-    struct chimera_server_s3_thread *thread,
-    struct chimera_s3_request       *request)
+static void
+chimera_s3_get_began(
+    enum chimera_vfs_error          error_code,
+    struct chimera_vfs_transaction *txn,
+    void                           *private_data)
 {
-    request->io_pending = 0;
+    struct chimera_s3_request       *request = private_data;
+    struct chimera_server_s3_thread *thread  = request->thread;
 
-    chimera_vfs_lookup(thread->vfs, &thread->shared->cred, NULL,
+    if (error_code != CHIMERA_VFS_OK) {
+        chimera_s3_get_fail(request);
+        return;
+    }
+
+    request->txn = txn;     /* NULL for a non-transactional backend (autocommit) */
+
+    chimera_vfs_lookup(thread->vfs, &thread->shared->cred, request->txn,
                        request->bucket_fh,
                        request->bucket_fhlen,
                        request->path,
@@ -199,4 +291,28 @@ chimera_s3_get(
                        CHIMERA_VFS_LOOKUP_FOLLOW,
                        chimera_s3_get_lookup_callback,
                        request);
+} /* chimera_s3_get_began */
+
+static void
+chimera_s3_get_begin(struct chimera_s3_request *request)
+{
+    struct chimera_server_s3_thread *thread = request->thread;
+
+    chimera_vfs_begin_transaction(thread->vfs, &thread->shared->cred,
+                                  request->bucket_fh, request->bucket_fhlen,
+                                  CHIMERA_VFS_TXN_READ, request->txn_ts,
+                                  chimera_s3_get_began, request);
+} /* chimera_s3_get_begin */
+
+void
+chimera_s3_get(
+    struct evpl                     *evpl,
+    struct chimera_server_s3_thread *thread,
+    struct chimera_s3_request       *request)
+{
+    request->io_pending  = 0;
+    request->txn_ts      = chimera_vfs_txn_alloc_ts(thread->vfs);
+    request->txn_attempt = 0;
+
+    chimera_s3_get_begin(request);
 } /* chimera_s3_get */
