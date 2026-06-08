@@ -111,15 +111,21 @@ chimera_smb_parse_lock(
         return -1;
     }
 
-    evpl_iovec_cursor_get_uint16(request_cursor, &request->lock.lock_count);
+    int prc = 0;
+    prc |= evpl_iovec_cursor_try_get_uint16(request_cursor, &request->lock.lock_count);
     /* LockSequenceNumber is 4 bits + LockSequenceIndex 28 bits = 32 bits.
      * We don't replay-detect by sequence in Stage B; just store. */
-    evpl_iovec_cursor_get_uint16(request_cursor, &reserved_lock_seq_lo);
-    evpl_iovec_cursor_get_uint16(request_cursor, (uint16_t *) &reserved_lock_seq_hi);
+    prc                        |= evpl_iovec_cursor_try_get_uint16(request_cursor, &reserved_lock_seq_lo);
+    prc                        |= evpl_iovec_cursor_try_get_uint16(request_cursor, (uint16_t *) &reserved_lock_seq_hi);
     request->lock.lock_sequence = ((uint32_t) reserved_lock_seq_lo) |
         (((uint32_t) reserved_lock_seq_hi) << 16);
-    evpl_iovec_cursor_get_uint64(request_cursor, &request->lock.file_id.pid);
-    evpl_iovec_cursor_get_uint64(request_cursor, &request->lock.file_id.vid);
+    prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->lock.file_id.pid);
+    prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->lock.file_id.vid);
+
+    if (unlikely(prc)) {
+        chimera_smb_error("Received SMB2 LOCK request truncated in fixed body");
+        return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+    }
 
     /* Only a LockCount of 1 carries a lock element we can read; a
      * zero-lock request (which smbtorture sends to probe rejection) has
@@ -128,10 +134,15 @@ chimera_smb_parse_lock(
      * INVALID_PARAMETER response rather than a parse failure — returning
      * -1 here would tear the connection down instead of replying. */
     if (request->lock.lock_count == 1) {
-        evpl_iovec_cursor_get_uint64(request_cursor, &request->lock.l_offset);
-        evpl_iovec_cursor_get_uint64(request_cursor, &request->lock.l_length);
-        evpl_iovec_cursor_get_uint32(request_cursor, &request->lock.l_flags);
-        evpl_iovec_cursor_get_uint32(request_cursor, &reserved);
+        prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->lock.l_offset);
+        prc |= evpl_iovec_cursor_try_get_uint64(request_cursor, &request->lock.l_length);
+        prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &request->lock.l_flags);
+        prc |= evpl_iovec_cursor_try_get_uint32(request_cursor, &reserved);
+
+        if (unlikely(prc)) {
+            chimera_smb_error("Received SMB2 LOCK element past message");
+            return chimera_smb_parse_reject(request, SMB2_STATUS_INVALID_PARAMETER);
+        }
     } else {
         request->lock.l_offset = 0;
         request->lock.l_length = 0;
