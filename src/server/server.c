@@ -85,6 +85,7 @@ struct chimera_server_config {
     int                                   smb_oplocks;
     int                                   smb_notify_disabled;
     int                                   smb_acl_inherited_canonicalize;
+    int                                   smb2_max_async_credits;
     int                                   smb_num_nic_info;
     uint32_t                              anonuid;
     uint32_t                              anongid;
@@ -204,6 +205,10 @@ chimera_server_config_init(void)
      * verbatim (Samba's "= no" mode that the smb2.acls_non_canonical suite
      * exercises). */
     config->smb_acl_inherited_canonicalize = 1;
+
+    /* Per-connection ceiling on outstanding async (STATUS_PENDING) operations.
+     * 512 matches the value smb2.credits.*_ipc_max_async_credits asserts. */
+    config->smb2_max_async_credits = 512;
 
     // SMB auth config defaults - local NTLM only
     config->smb_auth.winbind_enabled    = 0;
@@ -480,6 +485,20 @@ chimera_server_config_get_smb_acl_inherited_canonicalize(const struct chimera_se
 {
     return config->smb_acl_inherited_canonicalize;
 } /* chimera_server_config_get_smb_acl_inherited_canonicalize */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_smb2_max_async_credits(
+    struct chimera_server_config *config,
+    int                           value)
+{
+    config->smb2_max_async_credits = value;
+} /* chimera_server_config_set_smb2_max_async_credits */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_smb2_max_async_credits(const struct chimera_server_config *config)
+{
+    return config->smb2_max_async_credits;
+} /* chimera_server_config_get_smb2_max_async_credits */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_max_open_files(
