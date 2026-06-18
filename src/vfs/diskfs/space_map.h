@@ -23,29 +23,32 @@
  * intent log will replace; this is where on-disk durability hooks in.
  */
 
-#define SM_BLOCK_SHIFT            12
-#define SM_BLOCK_SIZE             (1ULL << SM_BLOCK_SHIFT)
-#define SM_BLOCK_MASK             (SM_BLOCK_SIZE - 1)
+#define SM_BLOCK_SHIFT              12
+#define SM_BLOCK_SIZE               (1ULL << SM_BLOCK_SHIFT)
+#define SM_BLOCK_MASK               (SM_BLOCK_SIZE - 1)
 
-#define SM_AG_SIZE_LOG2           30                        /* 1 GiB */
-#define SM_AG_SIZE                (1ULL << SM_AG_SIZE_LOG2)
-#define SM_AG_OFFSET_MASK         (SM_AG_SIZE - 1)
+#define SM_AG_SIZE_LOG2             30                      /* 1 GiB */
+#define SM_AG_SIZE                  (1ULL << SM_AG_SIZE_LOG2)
+#define SM_AG_OFFSET_MASK           (SM_AG_SIZE - 1)
 
-#define SM_SUPERBLOCK_OFFSET      0
-#define SM_SUPERBLOCK_SIZE        4096
-#define SM_SUPERBLOCK_MAGIC       0x4D5346534B534944ULL     /* "DISKSFSM" */
-#define SM_FORMAT_VERSION         2
+#define SM_SUPERBLOCK_OFFSET        0
+#define SM_SUPERBLOCK_SIZE          4096
+#define SM_SUPERBLOCK_MAGIC         0x4D5346534B534944ULL   /* "DISKSFSM" */
+#define SM_FORMAT_VERSION           3
 
 /*
  * Bootstrap inode blocks carved after AG 0's log on device 0 at format time:
  * block_idx 1 is reserved (inum 1 invalid by convention), 2 is the root
- * inode, and the next SM_BOOTSTRAP_ORPHAN_SLOTS blocks (inums 3..) are the
+ * inode, the next SM_BOOTSTRAP_ORPHAN_SLOTS blocks (inums 3..) are the
  * sharded orphan-list inodes (diskfs spreads deleted-inode records across
- * them so unlinks don't serialize on one inode's write lock).
+ * them so unlinks don't serialize on one inode's write lock), and the final
+ * SM_BOOTSTRAP_REFCOUNT_SLOTS block(s) host the extent-refcount tree(s) used by
+ * reflink/CLONE (copy-on-write share counts keyed by device offset).
  */
-#define SM_BOOTSTRAP_ORPHAN_SLOTS 16
+#define SM_BOOTSTRAP_ORPHAN_SLOTS   16
+#define SM_BOOTSTRAP_REFCOUNT_SLOTS 1
 
-#define SM_RESERVATION_MIN        (1ULL << 20)              /* 1 MiB */
+#define SM_RESERVATION_MIN          (1ULL << 20)            /* 1 MiB */
 
 #define SM_ALIGN_UP(x) (((x) + SM_BLOCK_MASK) & ~SM_BLOCK_MASK)
 
@@ -62,16 +65,16 @@
  * 0 we reserve block_idx == 1 at format time so the very first allocation
  * lands at block_idx == 2 (= inum 2 = the root inode).
  */
-#define SM_INUM_INDEX_BITS        32
-#define SM_INUM_AG_BITS           24
-#define SM_INUM_DISK_BITS         8
+#define SM_INUM_INDEX_BITS          32
+#define SM_INUM_AG_BITS             24
+#define SM_INUM_DISK_BITS           8
 
-#define SM_INUM_INDEX_MASK        ((1ULL << SM_INUM_INDEX_BITS) - 1)
-#define SM_INUM_AG_MASK           ((1ULL << SM_INUM_AG_BITS)    - 1)
-#define SM_INUM_DISK_MASK         ((1ULL << SM_INUM_DISK_BITS)  - 1)
+#define SM_INUM_INDEX_MASK          ((1ULL << SM_INUM_INDEX_BITS) - 1)
+#define SM_INUM_AG_MASK             ((1ULL << SM_INUM_AG_BITS)    - 1)
+#define SM_INUM_DISK_MASK           ((1ULL << SM_INUM_DISK_BITS)  - 1)
 
-#define SM_INUM_AG_SHIFT          SM_INUM_INDEX_BITS
-#define SM_INUM_DISK_SHIFT        (SM_INUM_INDEX_BITS + SM_INUM_AG_BITS)
+#define SM_INUM_AG_SHIFT            SM_INUM_INDEX_BITS
+#define SM_INUM_DISK_SHIFT          (SM_INUM_INDEX_BITS + SM_INUM_AG_BITS)
 
 /*
  * Each AG carves a fixed prefix off the front of its data range for its
@@ -80,14 +83,14 @@
  * fragmentation of a 1 GiB AG with 4 KiB blocks (~2 MiB per snapshot) with
  * comfortable headroom.
  */
-#define SM_AG_LOG_SLOT_SIZE       (4ULL << 20) /* 4 MiB */
-#define SM_AG_LOG_SLOT_COUNT      2
-#define SM_AG_LOG_SIZE            (SM_AG_LOG_SLOT_SIZE * SM_AG_LOG_SLOT_COUNT)
+#define SM_AG_LOG_SLOT_SIZE         (4ULL << 20) /* 4 MiB */
+#define SM_AG_LOG_SLOT_COUNT        2
+#define SM_AG_LOG_SIZE              (SM_AG_LOG_SLOT_SIZE * SM_AG_LOG_SLOT_COUNT)
 
 /* Free headroom (bytes) left in a slot's delta region when runtime
  * condensation is triggered; new journaling parks behind the condense, so
  * this is margin against the hard-full abort, not a budget that fills. */
-#define SM_AG_LOG_CONDENSE_MARGIN (64ULL << 10)
+#define SM_AG_LOG_CONDENSE_MARGIN   (64ULL << 10)
 
 /*
  * On-disk per-AG allocation log.  Each slot begins with this header, followed
@@ -101,10 +104,10 @@
  * no separate checksum -- a torn condensation simply leaves the older slot
  * live.
  */
-#define SM_AG_LOG_MAGIC           0x474F4C47414B5344ULL /* "DSKAGLOG" */
+#define SM_AG_LOG_MAGIC             0x474F4C47414B5344ULL /* "DSKAGLOG" */
 
-#define SM_AG_LOG_OP_ALLOC        0u /* [offset,len) was handed out: remove from free */
-#define SM_AG_LOG_OP_FREE         1u /* [offset,len) was returned:   add to free */
+#define SM_AG_LOG_OP_ALLOC          0u /* [offset,len) was handed out: remove from free */
+#define SM_AG_LOG_OP_FREE           1u /* [offset,len) was returned:   add to free */
 
 struct sm_ag_log_header {
     uint64_t magic;

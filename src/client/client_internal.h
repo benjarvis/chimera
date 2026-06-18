@@ -55,6 +55,7 @@ enum chimera_client_request_opcode {
     CHIMERA_CLIENT_OP_LOCK,
     CHIMERA_CLIENT_OP_COPY_RANGE,
     CHIMERA_CLIENT_OP_CLONE_RANGE,
+    CHIMERA_CLIENT_OP_WRITE_SAME,
 };
 
 struct chimera_client_request;
@@ -378,6 +379,18 @@ struct chimera_client_request {
             chimera_clone_range_callback_t  callback;
             void                           *private_data;
         } clone_range;
+
+        struct {
+            struct chimera_vfs_open_handle *handle;
+            uint64_t                        offset;
+            uint32_t                        block_size;
+            uint64_t                        block_count;
+            const void                     *pattern;
+            uint32_t                        pattern_len;
+            uint32_t                        reloff_pattern;
+            chimera_write_same_callback_t   callback;
+            void                           *private_data;
+        } write_same;
     };
 } __attribute__((aligned(64)));
 
