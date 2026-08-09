@@ -56,6 +56,11 @@ RUN apt-get -y update && \
     samba samba-ad-dc samba-ad-provision samba-vfs-modules smbclient samba-testsuite && \
     gem install jekyll bundler
 
+# Quint (pinned) generates the NFS3 model-based-test traces at build time;
+# see src/server/nfs/tests/quint/.  Bump deliberately: the trace a given
+# seed produces may change across quint versions.
+RUN npm install -g @informalsystems/quint@0.32.0
+
 RUN if [ "$ENABLE_CLAUDE" = "1" ] ; then \
     npm install -g @anthropic-ai/claude-code ; \
     fi
