@@ -20,6 +20,14 @@ CMAKE_ARGS_COVERAGE := -DCMAKE_BUILD_TYPE=Coverage -DCMAKE_C_COMPILER=clang
 CTEST_PARALLEL := $(shell n=$$(nproc); echo $$(( n < 64 ? n : 64 )))
 CTEST_ARGS := --output-on-failure --timeout 30 -j $(CTEST_PARALLEL)
 
+# Restrict the coverage run to a subset of the suite, e.g.
+#   make coverage COVERAGE_TESTS=nfs3_mbt
+# The value is a ctest -R regex.  Empty (the default) runs everything.  Useful
+# to measure what a specific suite exercises; the profile directory is cleared
+# each run, so the report reflects only the filtered tests.
+COVERAGE_TESTS ?=
+CTEST_FILTER := $(if ${COVERAGE_TESTS},-R ${COVERAGE_TESTS},)
+
 # Plain `make` produces a debug build only. Use `make debug`/`make release`
 # to also run the test suite, or `make check` for the full CI sweep.
 .DEFAULT_GOAL := build_debug
@@ -60,7 +68,7 @@ test_coverage: build_coverage
 	@rm -rf ${COVERAGE_DIR}
 	@mkdir -p ${COVERAGE_DIR}/profraw
 	-cd ${CHIMERA_BUILD_DIR}/Coverage && \
-		LLVM_PROFILE_FILE=${COVERAGE_DIR}/profraw/%m-%p.profraw ctest ${CTEST_ARGS}
+		LLVM_PROFILE_FILE=${COVERAGE_DIR}/profraw/%m-%p.profraw ctest ${CTEST_ARGS} ${CTEST_FILTER}
 	@bash etc/coverage-report.sh ${CHIMERA_BUILD_DIR}/Coverage
 
 .PHONY: debug
