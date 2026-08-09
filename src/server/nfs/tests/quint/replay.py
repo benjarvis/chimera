@@ -55,7 +55,7 @@ FSINFO_EXPECT = {"rtmax": 1048576, "rtpref": 1048576, "rtmult": 4096,
                  "dtpref": 65536, "maxfilesize": 0xffffffffffffffff,
                  "time_delta": (0, 1), "properties": 0x1b}
 PATHCONF_EXPECT = {"linkmax": 0xffffffff, "name_max": 255, "no_trunc": True,
-                   "chown_restricted": False, "case_insensitive": False,
+                   "chown_restricted": True, "case_insensitive": False,
                    "case_preserving": True}
 FSSTAT_EXPECT = {"tbytes": 107374182400, "fbytes": 107374182400,
                  "abytes": 107374182400, "tfiles": 1048576,
