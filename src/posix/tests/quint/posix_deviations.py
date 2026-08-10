@@ -30,9 +30,13 @@ from typing import Callable, Optional
 
 # Linux errno values referenced below.
 OK = 0
+EPERM = 1
+ENOENT = 2
 EBADF = 9
 EACCES = 13
+EEXIST = 17
 EINVAL = 22
+EMFILE = 24
 ENOSYS = 38
 EOPNOTSUPP = 95
 
@@ -236,6 +240,22 @@ KNOWN_DEVIATIONS = [
         reconcilable=True,
     ),
     Deviation(
+        id="PD15b",
+        posix="XBD 4.16: a trailing slash forces a final symlink to be "
+              "followed (ELOOP for a self-loop)",
+        summary="mkdir over a self-loop symlink named with a trailing "
+                "slash reports EEXIST; the slash should force following "
+                "and yield ELOOP",
+        root_cause="see PD15 (trailing slashes ignored on the mutation "
+                   "paths)",
+        candidate_fix="see PD15",
+        ops=("RMkdir",),
+        expected_status=40,
+        actual_status=EEXIST,
+        context=lambda op, fs: op.get("pth", {}).get("slash", False),
+        reconcilable=True,
+    ),
+    Deviation(
         id="PD17a",
         posix="unlink() EISDIR/EPERM vs EACCES priority (unspecified)",
         summary="unlink(directory) in a parent without write permission "
@@ -287,6 +307,61 @@ KNOWN_DEVIATIONS = [
                       "issue a VFS ACCESS op with the request credential)",
         ops=("RAccess",),
         expected_status=EACCES,
+        actual_status=OK,
+        reconcilable=True,
+    ),
+    Deviation(
+        id="PD17d",
+        posix="open()/mkdir()/link(): EEXIST vs EACCES/EPERM/ENOENT "
+              "priority on doubly-invalid calls (unspecified)",
+        summary="chimera reports the existing target (EEXIST) where the "
+                "model reports the search/permission or source error "
+                "first; both conditions hold, POSIX does not order them",
+        root_cause="existence checked before parent access / source "
+                   "resolution",
+        candidate_fix="none required; listed for visibility",
+        ops=("ROpen", "RMkdir", "RMknod", "RSymlink"),
+        expected_status=EACCES,
+        actual_status=EEXIST,
+        reconcilable=True,
+    ),
+    Deviation(
+        id="PD17e",
+        posix="link(): EPERM (directory source) vs EEXIST (existing "
+              "target) priority",
+        summary="link with a directory source and an existing target "
+                "reports EEXIST; the model reports the source error",
+        root_cause="target existence checked before source resolution",
+        candidate_fix="none required; listed for visibility",
+        ops=("RLink",),
+        expected_status=EPERM,
+        actual_status=EEXIST,
+        reconcilable=True,
+    ),
+    Deviation(
+        id="PD17f",
+        posix="link(): ENOENT (missing source) vs EEXIST (existing "
+              "target) priority",
+        summary="link with a missing source and an existing target "
+                "reports EEXIST; the model reports the source error",
+        root_cause="target existence checked before source resolution",
+        candidate_fix="none required; listed for visibility",
+        ops=("RLink",),
+        expected_status=ENOENT,
+        actual_status=EEXIST,
+        reconcilable=True,
+    ),
+    Deviation(
+        id="PD24",
+        posix="model bound, not a chimera defect",
+        summary="the model's per-process descriptor table holds 16 slots "
+                "(MAX_FDS) and predicts EMFILE when full; chimera's table "
+                "holds max_fds=1024, so the open succeeds",
+        root_cause="differing table bounds by design",
+        candidate_fix="n/a (the real descriptor leaks for the rest of the "
+                      "trace, which is harmless)",
+        ops=("ROpen", "RDup", "RFcntlDupfd", "ROpendir"),
+        expected_status=EMFILE,
         actual_status=OK,
         reconcilable=True,
     ),

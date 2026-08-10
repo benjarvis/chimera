@@ -681,6 +681,10 @@ module posixops {
             val nd = fs.inodes.get(o.ino)
             if (not(accReads(o.acc)))
                 out(fs, ps, SRw({ e: EBADF, n: 0, syms: [] }))
+            else if (nd.ftype == FDir)
+                // Same canonicalization as opRead: reading a directory
+                // descriptor is EISDIR.
+                out(fs, ps, SRw({ e: EISDIR, n: 0, syms: [] }))
             else if (off < 0)
                 out(fs, ps, SRw({ e: EINVAL, n: 0, syms: [] }))
             else {

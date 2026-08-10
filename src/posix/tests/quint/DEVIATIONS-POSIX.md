@@ -6,6 +6,15 @@ SPDX-License-Identifier: LGPL-2.1-only
 
 # Chimera POSIX-client deviations from POSIX.1-2024
 
+> 2026-08-10: the straightforward subset was fixed in the
+> `memfs-posix-fixes` commit series (see the Fixed section at the
+> bottom); the registry entries for fixed deviations no longer fire and
+> the remaining open items are the design-heavy ones (PD1 locks, PD3
+> dirfd plumbing, PD6 linkat follow, PD11 per-op re-authorization,
+> PD12 truncate/unlink open-cache aliasing, PD13/PD14 type-aware open
+> gates, PD15's mutation paths, PD16/PD17 acceptance choices, PD20
+> O_CREAT permission skip).
+
 Found by the POSIX model-based test suite (this directory) against the
 `chimera_posix_*` client API backed by memfs.  The model always encodes the
 standard's behavior; each divergence is registered in `posix_deviations.py`
@@ -244,4 +253,31 @@ the POSIX client, which never re-authorizes against the open-time rights.
 
 ## Fixed
 
-(none yet)
+Fixed 2026-08-10 by the `memfs-posix-fixes` series (branch pushed to
+benjarvis/chimera):
+
+- **PD2/PD10** — fcntl F_DUPFD/F_GETFL/F_SETFL implemented; the fd
+  allocator hands out the lowest free descriptor (open/dup/F_DUPFD).
+- **PD4** — write()/writev() honor O_APPEND (EOF resolved through the
+  open handle before each append write).
+- **PD5 (partial)/PD23** — dup/dup2 propagate the file offset and
+  status flags to the duplicate; full description sharing (one offset
+  object) remains open.
+- **PD7** — read/write/pread/pwrite/readv/writev/read_into and
+  copy/clone_file_range enforce the descriptor access mode (EBADF),
+  including the O_APPEND-destination rule for copy_file_range.
+- **PD8** — memfs fails read() of a directory with EISDIR (the model's
+  opPread gained the same canonicalization opRead already had).
+- **PD9** — chimera_posix_shutdown closes leaked descriptors instead of
+  hanging in the VFS close-thread handshake.
+- **PD15 (partial)** — stat()/lstat() enforce the trailing-slash
+  directory requirement, and lstat routes trailing-slash paths through
+  the following stat (ELOOP on self-loops).  Mutation paths still
+  accept trailing slashes.
+- **PD18** — faccessat evaluates the XBD 4.5 algorithm against the
+  chimera request credential (supplementary groups included), not the
+  host process uid/gid.
+- **PD19** — memfs clone_range rejects source ranges beyond EOF.
+- **PD21** — memfs truncation applies the kill-priv setuid/setgid
+  clearing like the write path.
+- **PD22** — negative SEEK_DATA/SEEK_HOLE offsets report ENXIO.
