@@ -45,7 +45,11 @@ function(posix_mbt_add_batch flavor steps ntraces seed)
              ${POSIX_MBT_TRACE_DIR}/${flavor}_${steps}_${seq}.itf.json)
     endforeach()
 
+    # quint exits 0 without writing anything if the output directory is
+    # missing (e.g. after an rm -rf of the trace dir, which only configure
+    # recreates), so make the directory part of the recipe.
     add_custom_command(OUTPUT ${traces}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${POSIX_MBT_TRACE_DIR}
         COMMAND ${QUINT_BIN} run ${POSIX_MBT_MODEL} --main=posixMemfs
                 --step=${flavor} --max-steps=${steps}
                 --max-samples=${ntraces} --n-traces=${ntraces} --seed=${seed}
