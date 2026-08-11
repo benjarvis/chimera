@@ -256,6 +256,51 @@ KNOWN_DEVIATIONS = [
         reconcilable=True,
     ),
     Deviation(
+        id="PD15c",
+        posix="XBD 4.16 vs mkdir(): a trailing slash on a DANGLING symlink",
+        summary="mkdir('dangling/') -- the model follows the link and "
+                "creates the target directory (strict XBD 4.16); chimera "
+                "(like Linux) reports the existing symlink name.  NOTE: "
+                "the model's state gains the created directory, so a later "
+                "step touching it may still diverge.",
+        root_cause="the client judges the slash-stripped name; creating "
+                   "through the link would need readlink+re-resolution",
+        candidate_fix="acceptance (Linux agrees with chimera here)",
+        ops=("RMkdir",),
+        expected_status=OK,
+        actual_status=EEXIST,
+        context=lambda op, fs: op.get("pth", {}).get("slash", False),
+        reconcilable=True,
+    ),
+    Deviation(
+        id="PD17h",
+        posix="rmdir(): ENOTDIR (victim not a directory) vs EACCES "
+              "(unwritable parent) priority (unspecified)",
+        summary="rmdir of a non-directory in an unwritable parent reports "
+                "EACCES; the model reports the type error first",
+        root_cause="the delete gate's parent fast path denies before the "
+                   "child's type is ever fetched",
+        candidate_fix="none required; listed for visibility",
+        ops=("RRmdir",),
+        expected_status=20,
+        actual_status=EACCES,
+        reconcilable=True,
+    ),
+    Deviation(
+        id="PD17i",
+        posix="rmdir(): ENOTEMPTY (victim not empty) vs EACCES (unwritable "
+              "parent) priority (unspecified)",
+        summary="rmdir of a non-empty directory in an unwritable parent "
+                "reports EACCES; the model reports the emptiness error "
+                "first",
+        root_cause="the delete gate denies before the child is examined",
+        candidate_fix="none required; listed for visibility",
+        ops=("RRmdir",),
+        expected_status=39,
+        actual_status=EACCES,
+        reconcilable=True,
+    ),
+    Deviation(
         id="PD17a",
         posix="unlink() EISDIR/EPERM vs EACCES priority (unspecified)",
         summary="unlink(directory) in a parent without write permission "
@@ -275,7 +320,7 @@ KNOWN_DEVIATIONS = [
                 "permission reports EACCES; the model reports EEXIST",
         root_cause="parent write access checked before existence",
         candidate_fix="none required; listed for visibility",
-        ops=("RMkdir",),
+        ops=("RMkdir", "RSymlink", "RMknod", "RLink"),
         expected_status=17,
         actual_status=EACCES,
         reconcilable=True,
