@@ -10,10 +10,10 @@ SPDX-License-Identifier: LGPL-2.1-only
 > `memfs-posix-fixes` commit series (see the Fixed section at the
 > bottom); the registry entries for fixed deviations no longer fire and
 > the remaining open items are the design-heavy ones (PD1 locks, PD3
-> dirfd plumbing, PD6 linkat follow, PD11 per-op re-authorization,
-> PD12 truncate/unlink open-cache aliasing, PD13/PD14 type-aware open
-> gates, PD15's mutation paths, PD16/PD17 acceptance choices, PD20
-> O_CREAT permission skip).
+> dirfd plumbing, PD6 linkat follow, PD12 truncate/unlink open-cache
+> aliasing, PD13/PD14 type-aware open gates, PD15's mutation paths,
+> PD16/PD17 acceptance choices).  2026-08-11: PD11 and PD20 fixed by
+> open-time rights binding (vfs: bind I/O access rights at open).
 
 Found by the POSIX model-based test suite (this directory) against the
 `chimera_posix_*` client API backed by memfs.  The model always encodes the
@@ -281,3 +281,13 @@ benjarvis/chimera):
 - **PD21** — memfs truncation applies the kill-priv setuid/setgid
   clearing like the write path.
 - **PD22** — negative SEEK_DATA/SEEK_HOLE offsets report ENXIO.
+- **PD11** (2026-08-11) — I/O rights bind at open: the engine stamps the
+  caller's effective grant on the open handle (plain-open wrapper and a
+  new open_at completion gate), read/write/ftruncate ride the grant and
+  survive later chmods, creations grant the requested access regardless
+  of the new mode, and new opens still check current permissions.
+  Path-based setattr keeps per-op checks via the chimera_vfs_setattr /
+  chimera_vfs_fsetattr split.  NFS3's stateless per-op semantics are
+  preserved (INFERRED/open_fh handles keep the lazy first-I/O grant).
+- **PD20** (2026-08-11) — the open_at completion gate authorizes O_CREAT
+  opens of existing files (same fix as PD11).
