@@ -230,6 +230,7 @@ class Replayer:
         self._cur_tag = None
         self._cur_req = None
         self._cur_fs = None
+        self._cur_ps = None
 
         for pid, cred in creds_for(caps["withRoot"]).items():
             self.drv.request(op="setcred", pid=pid, **cred)
@@ -405,16 +406,40 @@ class Replayer:
             self.fdmap[(pid, rv["nfd"])] = r["ret"]
         return r
 
+    def _fd_is_model_dir(self, pid, mfd, post_fs):
+        """True when the model maps (pid, fd) to a directory inode."""
+        ps = self._cur_ps
+        if ps is None:
+            return False
+        ofd = ps["fds"].get((pid, mfd))
+        if ofd is None:
+            return False
+        ino = ps["ofds"][ofd]["ino"]
+        node = post_fs["inodes"].get(ino)
+        return node is not None and node["ftype"]["tag"] == "FDir"
+
     def op_lseek(self, pid, rv, res_v, post_fs, mism):
         r = self.drv.request(op="lseek", pid=pid,
                              fd=self.rfd(pid, rv["fd"]),
                              off=rv["off"] * self.bs,
                              whence=WHENCE_MAP[rv["wh"]["tag"]])
-        if self.check_status(res_v["e"], r["err"], mism) \
+        local = []
+        if self.check_status(res_v["e"], r["err"], local) \
                 and res_v["e"] == 0:
             want = res_v["off"] * self.bs
             if r["ret"] != want:
-                mism.append(f"lseek: expected offset {want}, got {r['ret']}")
+                local.append(f"lseek: expected offset {want}, "
+                             f"got {r['ret']}")
+        if local and rv["wh"]["tag"] in ("WEnd", "WCur") \
+                and self._fd_is_model_dir(pid, rv["fd"], post_fs):
+            # PD25: POSIX leaves a directory's st_size unspecified; the
+            # model abstracts it as 0 while memfs reports a block, so
+            # size-relative seeks on directory descriptors legitimately
+            # disagree.  Accepted, recorded, never fatal.
+            self.deviations_hit["PD25"] = \
+                self.deviations_hit.get("PD25", 0) + 1
+        else:
+            mism.extend(local)
         return r
 
     def op_read(self, pid, rv, res_v, post_fs, mism):
@@ -849,6 +874,7 @@ class Replayer:
             self._cur_tag = tag
             self._cur_req = req["value"]
             self._cur_fs = state["fs"]
+            self._cur_ps = state.get("ps")
             r = handler(self, pid, req["value"], res["value"],
                         state["fs"], mism)
             self.history.append((idx, pid, tag, req["value"],
