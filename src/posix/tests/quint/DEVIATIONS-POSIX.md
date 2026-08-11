@@ -291,3 +291,12 @@ benjarvis/chimera):
   preserved (INFERRED/open_fh handles keep the lazy first-I/O grant).
 - **PD20** (2026-08-11) — the open_at completion gate authorizes O_CREAT
   opens of existing files (same fix as PD11).
+- **PD13/PD14** (2026-08-11) — both open paths apply the POSIX type
+  checks: data-access opens of FIFOs/sockets/devices fail ENXIO,
+  directory write-opens fail EISDIR, and O_NOFOLLOW on a symlink fails
+  ELOOP on the create/openat path too (SMB and INFERRED opens exempt).
+- **faccessat follow / fstatat AT_SYMLINK_NOFOLLOW** (2026-08-11) —
+  both left the stat request's follow flag uninitialized; access() now
+  resolves symlinks (dangling -> ENOENT, loop -> ELOOP) and fstatat
+  routes AT_SYMLINK_NOFOLLOW to lstat semantics (PD3 partial; real
+  dirfds still ENOSYS).
