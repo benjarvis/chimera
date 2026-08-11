@@ -68,6 +68,31 @@ module posixMemfs {
     import posixops.* from "./posix_ops"
 }
 
+// The chimera-diskfs/cairn profile, pinned to `--probe --backend diskfs`
+// and `--backend cairn` measurements on 2026-08-11: both probe identically
+// to memfs except clone_range is unsupported (F_CLONE_RANGE off).  One
+// instance therefore serves trace generation for both backends.
+module posixDisk {
+    import posix(
+        F_COPY_RANGE = FeatMandatory,
+        F_CLONE_RANGE = FeatOff,
+        F_SEEK_HOLE = FeatMandatory,
+        F_ROOT = FeatIfAdvertised,
+        P_GID_FROM_PARENT = FeatOff,
+        P_SGID_INHERIT = FeatOff,
+        P_WRITE_CLEARS_SETIDS = FeatMandatory,
+        P_PWRITE_APPENDS = FeatOff,
+        P_RENAME_CTIME = FeatMandatory,
+        P_STRICT_ATIME = FeatOff,
+        P_STICKY_WRITE_ARM = FeatOff,
+        P_ERR_NOTEMPTY = FeatMandatory,
+        P_ERR_STICKY_ACCES = FeatMandatory,
+        P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
+        P_ERR_LOCK_AGAIN = FeatMandatory
+    ).* from "./posix"
+    import posixops.* from "./posix_ops"
+}
+
 module posixStrict {
     import posix(
         F_COPY_RANGE = FeatMandatory,

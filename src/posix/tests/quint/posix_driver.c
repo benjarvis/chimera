@@ -734,14 +734,18 @@ handle(json_t *req)
 } /* handle */
 
 int
-main(void)
+main(
+    int    argc,
+    char **argv)
 {
     struct chimera_client_config *config;
     struct chimera_posix_client  *posix;
     struct prometheus_metrics    *metrics;
     struct chimera_vfs_cred       root_cred;
-    char                         *line = NULL;
-    size_t                        cap  = 0;
+    char                         *line    = NULL;
+    size_t                        cap     = 0;
+    const char                   *backend = (argc > 1) ? argv[1] : "memfs";
+    const char                   *storage = (argc > 2) ? argv[2] : NULL;
 
     proto_out = fdopen(dup(STDOUT_FILENO), "w");
     if (!proto_out || dup2(STDERR_FILENO, STDOUT_FILENO) < 0) {
@@ -756,15 +760,59 @@ main(void)
 
     chimera_vfs_cred_init_unix(&root_cred, 0, 0, 0, NULL);
 
-    /* Align memfs's internal block size with the harness's abstract block
-     * size so model holes are real holes (SEEK_HOLE granularity). */
+    /* Backend selection: argv[1] names the VFS module (default memfs),
+    * argv[2] is a scratch directory for backends with real storage. */
     config = chimera_client_config_init();
-    for (int i = 0; i < config->num_modules; i++) {
-        if (strcmp(config->modules[i].module_name, "memfs") == 0) {
-            snprintf(config->modules[i].config_data,
-                     sizeof(config->modules[i].config_data),
-                     "{\"block_size\": %d}", DRIVER_BLOCK_SIZE);
+
+    if (strcmp(backend, "memfs") == 0) {
+        /* Align memfs's internal block size with the harness's abstract
+         * block size so model holes are real holes (SEEK_HOLE granularity).
+         */
+        for (int i = 0; i < config->num_modules; i++) {
+            if (strcmp(config->modules[i].module_name, "memfs") == 0) {
+                snprintf(config->modules[i].config_data,
+                         sizeof(config->modules[i].config_data),
+                         "{\"block_size\": %d}", DRIVER_BLOCK_SIZE);
+            }
         }
+    } else if (strcmp(backend, "diskfs") == 0) {
+        char img[3800];
+        char cfg[4096];
+        int  fd;
+
+        if (!storage) {
+            fprintf(stderr, "posix_driver: diskfs needs a storage dir\n");
+            return 1;
+        }
+        snprintf(img, sizeof(img), "%s/device-0.img", storage);
+        fd = open(img, O_CREAT | O_TRUNC | O_RDWR, 0644);
+        if (fd < 0 || ftruncate(fd, 1024LL * 1024 * 1024) != 0) {
+            fprintf(stderr, "posix_driver: device image %s: %s\n",
+                    img, strerror(errno));
+            return 1;
+        }
+        close(fd);
+        /* 1 GiB sparse device; pin a small (64 MiB) intent log so the
+        * journal fits the scratch device's first allocation group. */
+        snprintf(cfg, sizeof(cfg),
+                 "{\"initialize\":true,\"unsafe_async\":true,"
+                 "\"intent_log_size\":67108864,"
+                 "\"devices\":[{\"type\":\"libaio\",\"size\":1,\"path\":\"%s\"}]}",
+                 img);
+        chimera_client_config_add_module(config, "diskfs", "", cfg);
+    } else if (strcmp(backend, "cairn") == 0) {
+        char cfg[4096];
+
+        if (!storage) {
+            fprintf(stderr, "posix_driver: cairn needs a storage dir\n");
+            return 1;
+        }
+        snprintf(cfg, sizeof(cfg),
+                 "{\"initialize\":true,\"path\":\"%s\"}", storage);
+        chimera_client_config_add_module(config, "cairn", "", cfg);
+    } else {
+        fprintf(stderr, "posix_driver: unknown backend %s\n", backend);
+        return 1;
     }
 
     posix = chimera_posix_init(config, &root_cred, metrics);
@@ -773,8 +821,8 @@ main(void)
         return 1;
     }
 
-    if (chimera_posix_mount("/test", "memfs", "/") != 0) {
-        fprintf(stderr, "posix_driver: memfs mount failed\n");
+    if (chimera_posix_mount("/test", backend, "/") != 0) {
+        fprintf(stderr, "posix_driver: %s mount failed\n", backend);
         return 1;
     }
 

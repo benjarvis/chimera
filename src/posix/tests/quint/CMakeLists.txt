@@ -33,16 +33,18 @@ file(MAKE_DIRECTORY ${POSIX_MBT_TRACE_DIR})
 
 set(POSIX_MBT_TRACE_FILES)
 
-# Generate a batch of N traces for one (flavor, steps) with a single quint
-# invocation (same amortization as the NFS3 suite: node startup + parse
-# dominate, so --n-traces batches are nearly free).  --invariant=inv gates
-# every trace, so a model bug fails the build.
-function(posix_mbt_add_batch flavor steps ntraces seed)
+# Generate a batch of N traces for one (instance, flavor, steps) with a
+# single quint invocation (same amortization as the NFS3 suite: node startup
+# + parse dominate, so --n-traces batches are nearly free).  --invariant=inv
+# gates every trace, so a model bug fails the build.  Extra arguments name
+# the backends the batch replays against (one add_test per backend); the
+# prefix keeps trace files from different instances apart.
+function(posix_mbt_add_batch instance prefix flavor steps ntraces seed)
     set(traces)
     math(EXPR last "${ntraces} - 1")
     foreach(seq RANGE 0 ${last})
         list(APPEND traces
-             ${POSIX_MBT_TRACE_DIR}/${flavor}_${steps}_${seed}_${seq}.itf.json)
+             ${POSIX_MBT_TRACE_DIR}/${prefix}${flavor}_${steps}_${seed}_${seq}.itf.json)
     endforeach()
 
     # quint exits 0 without writing anything if the output directory is
@@ -50,17 +52,17 @@ function(posix_mbt_add_batch flavor steps ntraces seed)
     # recreates), so make the directory part of the recipe.
     add_custom_command(OUTPUT ${traces}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${POSIX_MBT_TRACE_DIR}
-        COMMAND ${QUINT_BIN} run ${POSIX_MBT_MODEL} --main=posixMemfs
+        COMMAND ${QUINT_BIN} run ${POSIX_MBT_MODEL} --main=${instance}
                 --step=${flavor} --max-steps=${steps}
                 --max-samples=${ntraces} --n-traces=${ntraces} --seed=${seed}
                 --invariant=inv
-                --out-itf=${POSIX_MBT_TRACE_DIR}/${flavor}_${steps}_${seed}_{seq}.itf.json > /dev/null
+                --out-itf=${POSIX_MBT_TRACE_DIR}/${prefix}${flavor}_${steps}_${seed}_{seq}.itf.json > /dev/null
         DEPENDS ${POSIX_MBT_MODEL}
                 ${CMAKE_CURRENT_SOURCE_DIR}/posix.qnt
                 ${CMAKE_CURRENT_SOURCE_DIR}/posix_ops.qnt
                 ${CMAKE_CURRENT_SOURCE_DIR}/posix_fs.qnt
                 ${CMAKE_CURRENT_SOURCE_DIR}/posix_state.qnt
-        COMMENT "Generating ${ntraces} POSIX MBT traces ${flavor} steps=${steps}"
+        COMMENT "Generating ${ntraces} POSIX MBT traces ${instance}/${flavor} steps=${steps}"
         VERBATIM)
 
     list(APPEND POSIX_MBT_TRACE_FILES ${traces})
@@ -68,33 +70,53 @@ function(posix_mbt_add_batch flavor steps ntraces seed)
 
     foreach(trace ${traces})
         get_filename_component(tname ${trace} NAME_WE)
-        set(name chimera/posix/mbt/${tname}_memfs)
-        add_test(NAME ${name}
-            COMMAND ${Python3_EXECUTABLE} ${POSIX_MBT_REPLAY}
-                    --trace ${trace}
-                    --driver $<TARGET_FILE:posix_quint_driver>)
-        set_tests_properties(${name} PROPERTIES
-            LABELS "posix_mbt;memfs"
-            ENVIRONMENT "PYTHONUNBUFFERED=1"
-            SKIP_RETURN_CODE 77
-            TIMEOUT 120)
+        foreach(backend ${ARGN})
+            set(name chimera/posix/mbt/${tname}_${backend})
+            add_test(NAME ${name}
+                COMMAND ${Python3_EXECUTABLE} ${POSIX_MBT_REPLAY}
+                        --trace ${trace}
+                        --backend ${backend}
+                        --driver $<TARGET_FILE:posix_quint_driver>)
+            set_tests_properties(${name} PROPERTIES
+                LABELS "posix_mbt;${backend}"
+                ENVIRONMENT "PYTHONUNBUFFERED=1"
+                SKIP_RETURN_CODE 77
+                TIMEOUT 120)
+        endforeach()
     endforeach()
 endfunction()
 
-posix_mbt_add_batch(step            128 10 0x1)
-posix_mbt_add_batch(step            128  6 0x2)
-posix_mbt_add_batch(step            256  3 0x100)
-posix_mbt_add_batch(step            512  2 0x5)
-posix_mbt_add_batch(stepNamespace   128  4 0x1)
-posix_mbt_add_batch(stepNamespace   256  2 0x9)
-posix_mbt_add_batch(stepDescriptors 128  4 0x1)
-posix_mbt_add_batch(stepMetadata    128  4 0x1)
-posix_mbt_add_batch(stepDirs        128  3 0x1)
-posix_mbt_add_batch(stepData        128  4 0x1)
-posix_mbt_add_batch(stepLocks       128  2 0x1)
-posix_mbt_add_batch(stepPerms       128  5 0x1)
-posix_mbt_add_batch(stepLinks       128  5 0x1)
-posix_mbt_add_batch(stepFds         128  5 0x1)
+posix_mbt_add_batch(posixMemfs "" step            128 10 0x1   memfs)
+posix_mbt_add_batch(posixMemfs "" step            128  6 0x2   memfs)
+posix_mbt_add_batch(posixMemfs "" step            256  3 0x100 memfs)
+posix_mbt_add_batch(posixMemfs "" step            512  2 0x5   memfs)
+posix_mbt_add_batch(posixMemfs "" stepNamespace   128  4 0x1   memfs)
+posix_mbt_add_batch(posixMemfs "" stepNamespace   256  2 0x9   memfs)
+posix_mbt_add_batch(posixMemfs "" stepDescriptors 128  4 0x1   memfs)
+posix_mbt_add_batch(posixMemfs "" stepMetadata    128  4 0x1   memfs)
+posix_mbt_add_batch(posixMemfs "" stepDirs        128  3 0x1   memfs)
+posix_mbt_add_batch(posixMemfs "" stepData        128  4 0x1   memfs)
+posix_mbt_add_batch(posixMemfs "" stepLocks       128  2 0x1   memfs)
+posix_mbt_add_batch(posixMemfs "" stepPerms       128  5 0x1   memfs)
+posix_mbt_add_batch(posixMemfs "" stepLinks       128  5 0x1   memfs)
+posix_mbt_add_batch(posixMemfs "" stepFds         128  5 0x1   memfs)
+
+# diskfs and cairn probe identically (memfs profile minus clone_range), so
+# one posixDisk trace corpus replays against both backends.
+posix_mbt_add_batch(posixDisk disk_ step            128 10 0x1   diskfs cairn)
+posix_mbt_add_batch(posixDisk disk_ step            128  6 0x2   diskfs cairn)
+posix_mbt_add_batch(posixDisk disk_ step            256  3 0x100 diskfs cairn)
+posix_mbt_add_batch(posixDisk disk_ step            512  2 0x5   diskfs cairn)
+posix_mbt_add_batch(posixDisk disk_ stepNamespace   128  4 0x1   diskfs cairn)
+posix_mbt_add_batch(posixDisk disk_ stepNamespace   256  2 0x9   diskfs cairn)
+posix_mbt_add_batch(posixDisk disk_ stepDescriptors 128  4 0x1   diskfs cairn)
+posix_mbt_add_batch(posixDisk disk_ stepMetadata    128  4 0x1   diskfs cairn)
+posix_mbt_add_batch(posixDisk disk_ stepDirs        128  3 0x1   diskfs cairn)
+posix_mbt_add_batch(posixDisk disk_ stepData        128  4 0x1   diskfs cairn)
+posix_mbt_add_batch(posixDisk disk_ stepLocks       128  2 0x1   diskfs cairn)
+posix_mbt_add_batch(posixDisk disk_ stepPerms       128  5 0x1   diskfs cairn)
+posix_mbt_add_batch(posixDisk disk_ stepLinks       128  5 0x1   diskfs cairn)
+posix_mbt_add_batch(posixDisk disk_ stepFds         128  5 0x1   diskfs cairn)
 
 add_custom_target(posix_mbt_traces ALL DEPENDS ${POSIX_MBT_TRACE_FILES})
 

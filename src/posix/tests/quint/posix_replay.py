@@ -31,6 +31,7 @@ import argparse
 import base64
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -83,6 +84,18 @@ PROFILE = {
     "errStickyAcces": True,
     "errUnlinkDirIsdir": True,
     "errLockAgain": None,
+}
+
+# Per-backend live profiles.  diskfs and cairn probed identically on
+# 2026-08-11: the only drift from memfs is that clone_range is unsupported.
+# Trace generation for them uses posix_run.qnt's posixDisk instance, which
+# pins the same profile, so their traces never skip either.
+DISK_PROFILE = dict(PROFILE, cloneRange=False)
+
+PROFILES = {
+    "memfs": PROFILE,
+    "diskfs": DISK_PROFILE,
+    "cairn": DISK_PROFILE,
 }
 
 
@@ -143,11 +156,19 @@ def load_trace(path):
 class Driver:
     """posix_driver process wrapper: one JSON request line per call."""
 
-    def __init__(self, driver_path):
+    def __init__(self, driver_path, backend="memfs"):
+        self.storage = None
+        argv = [driver_path]
+        if backend != "memfs":
+            # Real-storage backends get a private scratch dir, removed on
+            # close (diskfs writes a sparse device image, cairn a rocksdb).
+            self.storage = tempfile.mkdtemp(prefix=f"pq_{backend}_",
+                                            dir=os.getcwd())
+            argv = [driver_path, backend, self.storage]
         self.stderr_file = tempfile.NamedTemporaryFile(
             prefix="posix_mbt_", suffix=".stderr", delete=False)
         self.proc = subprocess.Popen(
-            [driver_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=self.stderr_file, text=True)
         ready = self.proc.stdout.readline()
         try:
@@ -187,6 +208,8 @@ class Driver:
         finally:
             self.stderr_file.close()
             os.unlink(self.stderr_file.name)
+            if self.storage is not None:
+                shutil.rmtree(self.storage, ignore_errors=True)
 
 
 def real_path(pth):
@@ -1033,8 +1056,8 @@ def diff_bytes(expect, actual, block_size):
 # behind posix_driver, for pinning PROFILE and posix_run.qnt's posixMemfs.
 # ---------------------------------------------------------------------------
 
-def probe(driver_path):
-    drv = Driver(driver_path)
+def probe(driver_path, backend="memfs"):
+    drv = Driver(driver_path, backend)
     bs = drv.block_size
     out = {}
     root = {"uid": 0, "gid": 10, "gids": [10, 30]}
@@ -1199,13 +1222,13 @@ def run_trace(trace_path, args):
         raise TraceFormatError(f"{trace_path}: first label is not LInit")
     caps = init["value"]["caps"]
 
-    for key, want in PROFILE.items():
+    for key, want in PROFILES[args.backend].items():
         if want is not None and caps.get(key) != want:
             print(f"{trace_path}: SKIP: trace profile {key}="
                   f"{caps.get(key)} does not match live profile {want}")
             sys.exit(77)
 
-    driver = Driver(args.driver)
+    driver = Driver(args.driver, args.backend)
     try:
         replayer = Replayer(driver, caps, verbose=args.verbose)
         audited = 0
@@ -1239,6 +1262,9 @@ def main():
     ap.add_argument("--driver", help="path to the posix_quint_driver binary")
     ap.add_argument("--dry-run", action="store_true",
                     help="parse and validate traces without a driver")
+    ap.add_argument("--backend", default="memfs",
+                    choices=sorted(PROFILES),
+                    help="VFS backend behind the driver (default memfs)")
     ap.add_argument("--probe", action="store_true",
                     help="measure the live capability/policy profile")
     ap.add_argument("--check-profile", action="store_true",
@@ -1257,10 +1283,10 @@ def main():
     if args.probe or args.check_profile:
         if not args.driver:
             ap.error("--driver is required for probing")
-        measured = probe(args.driver)
+        measured = probe(args.driver, args.backend)
         print(json.dumps(measured, indent=2))
         if args.check_profile:
-            bad = [k for k, v in PROFILE.items()
+            bad = [k for k, v in PROFILES[args.backend].items()
                    if v is not None and measured.get(k) != v]
             if bad:
                 print(f"PROFILE drift on: {bad}", file=sys.stderr)
