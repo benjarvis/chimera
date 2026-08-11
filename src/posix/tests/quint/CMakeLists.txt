@@ -42,7 +42,7 @@ function(posix_mbt_add_batch flavor steps ntraces seed)
     math(EXPR last "${ntraces} - 1")
     foreach(seq RANGE 0 ${last})
         list(APPEND traces
-             ${POSIX_MBT_TRACE_DIR}/${flavor}_${steps}_${seq}.itf.json)
+             ${POSIX_MBT_TRACE_DIR}/${flavor}_${steps}_${seed}_${seq}.itf.json)
     endforeach()
 
     # quint exits 0 without writing anything if the output directory is
@@ -54,7 +54,7 @@ function(posix_mbt_add_batch flavor steps ntraces seed)
                 --step=${flavor} --max-steps=${steps}
                 --max-samples=${ntraces} --n-traces=${ntraces} --seed=${seed}
                 --invariant=inv
-                --out-itf=${POSIX_MBT_TRACE_DIR}/${flavor}_${steps}_{seq}.itf.json > /dev/null
+                --out-itf=${POSIX_MBT_TRACE_DIR}/${flavor}_${steps}_${seed}_{seq}.itf.json > /dev/null
         DEPENDS ${POSIX_MBT_MODEL}
                 ${CMAKE_CURRENT_SOURCE_DIR}/posix.qnt
                 ${CMAKE_CURRENT_SOURCE_DIR}/posix_ops.qnt
@@ -82,13 +82,19 @@ function(posix_mbt_add_batch flavor steps ntraces seed)
 endfunction()
 
 posix_mbt_add_batch(step            128 10 0x1)
+posix_mbt_add_batch(step            128  6 0x2)
 posix_mbt_add_batch(step            256  3 0x100)
+posix_mbt_add_batch(step            512  2 0x5)
 posix_mbt_add_batch(stepNamespace   128  4 0x1)
+posix_mbt_add_batch(stepNamespace   256  2 0x9)
 posix_mbt_add_batch(stepDescriptors 128  4 0x1)
 posix_mbt_add_batch(stepMetadata    128  4 0x1)
 posix_mbt_add_batch(stepDirs        128  3 0x1)
 posix_mbt_add_batch(stepData        128  4 0x1)
 posix_mbt_add_batch(stepLocks       128  2 0x1)
+posix_mbt_add_batch(stepPerms       128  5 0x1)
+posix_mbt_add_batch(stepLinks       128  5 0x1)
+posix_mbt_add_batch(stepFds         128  5 0x1)
 
 add_custom_target(posix_mbt_traces ALL DEPENDS ${POSIX_MBT_TRACE_FILES})
 

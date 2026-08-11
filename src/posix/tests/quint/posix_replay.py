@@ -227,6 +227,7 @@ class Replayer:
         self.timemap = {}     # (model ino, field) -> (abstract, (sec, ns))
         self.history = []
         self.deviations_hit = {}
+        self.audit_exempt = set()  # model paths of PD24 residue nodes
         self._cur_tag = None
         self._cur_req = None
         self._cur_fs = None
@@ -372,6 +373,15 @@ class Replayer:
         if self.check_status(res_v["e"], r["err"], mism) \
                 and res_v["e"] == 0:
             self.fdmap[(pid, res_v["fd"])] = r["ret"]
+        elif res_v["e"] == 24 and r["err"] == 0 and r["ret"] >= 0:
+            # PD24 (EMFILE): the model's 16-slot table was full but
+            # chimera's larger table let the open succeed.  Close the
+            # stray descriptor to restore parity, and when O_CREAT minted
+            # a node the model never created, exempt it from the final
+            # audit (the state divergence is the accepted PD24 residue).
+            self.drv.request(op="close", pid=pid, fd=r["ret"])
+            if fl["creat"]:
+                self.audit_exempt.add("/" + "/".join(rv["pth"]["comps"]))
         return r
 
     def op_close(self, pid, rv, res_v, post_fs, mism):
@@ -430,11 +440,12 @@ class Replayer:
             if r["ret"] != want:
                 local.append(f"lseek: expected offset {want}, "
                              f"got {r['ret']}")
-        if local and rv["wh"]["tag"] in ("WEnd", "WCur") \
+        if local and rv["wh"]["tag"] in ("WEnd", "WCur", "WData", "WHole") \
                 and self._fd_is_model_dir(pid, rv["fd"], post_fs):
             # PD25: POSIX leaves a directory's st_size unspecified; the
             # model abstracts it as 0 while memfs reports a block, so
-            # size-relative seeks on directory descriptors legitimately
+            # size-relative seeks (and SEEK_DATA/SEEK_HOLE, whose ENXIO
+            # boundary is the size) on directory descriptors legitimately
             # disagree.  Accepted, recorded, never fatal.
             self.deviations_hit["PD25"] = \
                 self.deviations_hit.get("PD25", 0) + 1
@@ -845,6 +856,125 @@ class Replayer:
         "RCloneRange": op_clone_range,
     }
 
+    def final_audit(self, final_state, nsteps):
+        """End-of-trace sweep: walk the final model tree and verify every
+        reachable object's identity, attributes, directory contents, file
+        data and link targets against the live filesystem.  Catches silent
+        state drift the per-operation checks never observed.  Runs as an
+        out-of-band root credential (pid 3) so permission bits cannot mask
+        the comparison."""
+        fs = final_state["fs"]
+        mism = []
+        audited = 0
+
+        self.drv.request(op="setcred", pid=3, uid=0, gid=0, gids=[])
+
+        stack = [(0, "")]
+        while stack and len(mism) < 20:
+            ino, rpath = stack.pop()
+            node = fs["inodes"][ino]
+
+            r = self.drv.request(op="opendir", pid=3, path=MOUNT + rpath)
+            if r["err"] != 0:
+                mism.append(f"audit: opendir {rpath or '/'}: errno "
+                            f"{r['err']}")
+                continue
+            sid = r["ret"]
+            names = set(self.drv.request(op="readdir", pid=3,
+                                         sid=sid).get("names", []))
+            names -= {".", ".."}
+            self.drv.request(op="closedir", pid=3, sid=sid)
+
+            want_names = set(node["ents"].keys())
+
+            # PD24 residue: nodes chimera legitimately created where the
+            # model's descriptor table predicted EMFILE do not exist in the
+            # model tree; ignore exactly those chimera-only entries (an
+            # O_CREAT open of a file that exists in the model created
+            # nothing, so entries the model also has are never dropped).
+            names -= {n for n in names - want_names
+                      if rpath + "/" + n in self.audit_exempt}
+            if names != want_names:
+                mism.append(f"audit: dir {rpath or '/'}: entries "
+                            f"{sorted(names)} != model "
+                            f"{sorted(want_names)}")
+
+            for name in sorted(want_names & names):
+                cino = node["ents"][name]
+                cnode = fs["inodes"][cino]
+                cpath = rpath + "/" + name
+                ftag = cnode["ftype"]["tag"]
+                audited += 1
+
+                st = self.drv.request(op="stat", pid=3, path=MOUNT + cpath,
+                                      follow=False)
+                if st["err"] != 0:
+                    mism.append(f"audit: lstat {cpath}: errno {st['err']}")
+                    continue
+                if st.get("ftype") != FTYPE_MAP[ftag]:
+                    mism.append(f"audit: {cpath}: ftype "
+                                f"{st.get('ftype')} != {FTYPE_MAP[ftag]}")
+                    continue
+                if ftag != "FLnk" and st.get("mode") != cnode["mode"]:
+                    mism.append(f"audit: {cpath}: mode "
+                                f"{st.get('mode', 0):#o} != "
+                                f"{cnode['mode']:#o}")
+                if st.get("uid") != cnode["uid"] or \
+                        st.get("gid") != cnode["gid"]:
+                    mism.append(f"audit: {cpath}: owner "
+                                f"{st.get('uid')}:{st.get('gid')} != "
+                                f"{cnode['uid']}:{cnode['gid']}")
+                if st.get("nlink") != cnode["nlink"]:
+                    mism.append(f"audit: {cpath}: nlink "
+                                f"{st.get('nlink')} != {cnode['nlink']}")
+
+                ident = (st.get("dev"), st.get("ino"))
+                known = self.inomap.get(cino)
+                if known is not None and known != ident:
+                    mism.append(f"audit: {cpath}: identity {ident} != "
+                                f"learned {known}")
+
+                if ftag == "FDir":
+                    stack.append((cino, cpath))
+                elif ftag == "FLnk":
+                    r = self.drv.request(op="readlink", pid=3,
+                                         path=MOUNT + cpath)
+                    want = real_target(cnode["target"])
+                    if r["err"] != 0 or r.get("target") != want:
+                        mism.append(f"audit: readlink {cpath}: "
+                                    f"{r.get('target')!r} != {want!r}")
+                elif ftag == "FReg":
+                    want_size = cnode["sizeBlocks"] * self.bs
+                    if st.get("size") != want_size:
+                        mism.append(f"audit: {cpath}: size "
+                                    f"{st.get('size')} != {want_size}")
+                        continue
+                    if want_size == 0:
+                        continue
+                    fd = self.drv.request(op="open", pid=3,
+                                          path=MOUNT + cpath,
+                                          flags=os.O_RDONLY, mode=0)
+                    if fd["err"] != 0:
+                        mism.append(f"audit: open {cpath}: errno "
+                                    f"{fd['err']}")
+                        continue
+                    r = self.drv.request(op="pread", pid=3, fd=fd["ret"],
+                                         off=0, len=want_size)
+                    self.drv.request(op="close", pid=3, fd=fd["ret"])
+                    blocks = cnode["blocks"]
+                    expect = b"".join(
+                        self.block_bytes(blocks.get(i, 0))
+                        for i in range(cnode["sizeBlocks"]))
+                    data = base64.b64decode(r.get("data", ""))
+                    if data != expect:
+                        mism.append(
+                            f"audit: {cpath}: content mismatch"
+                            + diff_bytes(expect, data, self.bs))
+
+        if mism:
+            raise Divergence(nsteps, ("final-audit", {}), mism)
+        return audited
+
     def cleanup(self):
         """Best-effort close of everything still open, so driver shutdown
         does not trip chimera's shutdown-with-open-descriptors hang (PD9)."""
@@ -1044,7 +1174,8 @@ def probe(driver_path):
 def report_divergence(trace_path, div, replayer, driver):
     print(f"\n=== DIVERGENCE in {trace_path} ===", file=sys.stderr)
     print(f"step {div.step}: {div.op[0]} req: {div.op[1]}", file=sys.stderr)
-    print(f"  model expectation: {div.op[2]}", file=sys.stderr)
+    if len(div.op) > 2:
+        print(f"  model expectation: {div.op[2]}", file=sys.stderr)
     for m in div.mismatches:
         print(f"  MISMATCH: {m}", file=sys.stderr)
     print("\nlast operations before failure:", file=sys.stderr)
@@ -1077,8 +1208,10 @@ def run_trace(trace_path, args):
     driver = Driver(args.driver)
     try:
         replayer = Replayer(driver, caps, verbose=args.verbose)
+        audited = 0
         try:
             replayer.replay(states)
+            audited = replayer.final_audit(states[-1], len(states) - 1)
         except Divergence as div:
             report_divergence(trace_path, div, replayer, driver)
             replayer.cleanup()
@@ -1091,8 +1224,8 @@ def run_trace(trace_path, args):
                 f"{k}x{v}"
                 for k, v in sorted(replayer.deviations_hit.items()))
             dev_summary = f"; known deviations: {parts}"
-        print(f"{trace_path}: {len(states) - 1} steps replayed"
-              f"{dev_summary}")
+        print(f"{trace_path}: {len(states) - 1} steps replayed, "
+              f"{audited} objects audited{dev_summary}")
         return True
     finally:
         driver.close()

@@ -760,6 +760,30 @@ module posix {
         genOpenFile, genOpenCreat
     }
 
+    // Focused flavors for behaviors the broad mixes starve:
+
+    // Permission interplay between the two credentials: ownership churn,
+    // mode churn, and opens/access checks that race them.
+    action stepPerms = any {
+        genChmod, genFchmod, genChown, genUmask, genAccess, genOpenFile,
+        genOpenCreat, genUtimens, genStatEntry
+    }
+
+    // Symlink webs: creation (incl. self-loops), resolution through
+    // links (stat raw paths, link-follow), and namespace churn around
+    // them.
+    action stepLinks = any {
+        genSymlink, genSymlinkSelf, genLink, genReadlink, genStatRaw,
+        genStatEntry, genRename, genUnlink, genOpenFile
+    }
+
+    // Descriptor-table churn: duplicates, dirfd-relative calls (including
+    // through directories removed while open), and fcntl traffic.
+    action stepFds = any {
+        genOpenFile, genOpenCreat, genOpenDir, genDup, genAtCall,
+        genClose, genLseek, genFcntlMisc, genRmdir, genUnlink
+    }
+
     action step = any {
         stepNamespace, stepDescriptors, stepMetadata, stepLocks,
         stepDirs, stepData

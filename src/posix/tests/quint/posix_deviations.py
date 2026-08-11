@@ -403,8 +403,9 @@ KNOWN_DEVIATIONS = [
                 "(MAX_FDS) and predicts EMFILE when full; chimera's table "
                 "holds max_fds=1024, so the open succeeds",
         root_cause="differing table bounds by design",
-        candidate_fix="n/a (the real descriptor leaks for the rest of the "
-                      "trace, which is harmless)",
+        candidate_fix="n/a (the replayer closes the stray descriptor and "
+                      "exempts any O_CREAT residue node from the final "
+                      "audit)",
         ops=("ROpen", "RDup", "RFcntlDupfd", "ROpendir"),
         expected_status=EMFILE,
         actual_status=OK,
