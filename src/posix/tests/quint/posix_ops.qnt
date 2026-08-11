@@ -1411,14 +1411,17 @@ module posixops {
     pure def opCloneRange(fs: Fs, ps: Pstate, caps: Caps, p: Pid,
                           fdDst: Fd, offDst: int, fdSrc: Fd, offSrc: int,
                           len: int): Out =
-        if (not(caps.cloneRange)) outErr(fs, ps, EOPNOTSUPP)
-        else if (not(fdLive(ps, p, fdDst)) or not(fdLive(ps, p, fdSrc)))
+        // Linux orders the descriptor checks before the filesystem-support
+        // check: FICLONERANGE's EBADF (bad fd / wrong access mode) wins over
+        // EOPNOTSUPP from a backend without reflink support.
+        if (not(fdLive(ps, p, fdDst)) or not(fdLive(ps, p, fdSrc)))
             outErr(fs, ps, EBADF)
         else {
             val od = fdOfd(ps, p, fdDst)
             val os = fdOfd(ps, p, fdSrc)
             if (not(accWrites(od.acc)) or not(accReads(os.acc)))
                 outErr(fs, ps, EBADF)
+            else if (not(caps.cloneRange)) outErr(fs, ps, EOPNOTSUPP)
             else if (fs.inodes.get(od.ino).ftype != FReg or
                      fs.inodes.get(os.ino).ftype != FReg)
                 outErr(fs, ps, EINVAL)
