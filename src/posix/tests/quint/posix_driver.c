@@ -28,15 +28,20 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <jansson.h>
 
 #include "posix/posix_internal.h"
+#include "server/server.h"
 #include "common/logging.h"
 #include "prometheus-c.h"
 
@@ -161,6 +166,41 @@ jbool(
 
     return v && json_is_boolean(v) ? json_is_true(v) : dflt;
 } /* jbool */
+
+/* Move this (still single-threaded) process into a private network
+ * namespace with loopback up, so the in-process NFS server's fixed ports
+ * (111/2049/20048/NLM) never collide with concurrent drivers or anything
+ * else on the machine.  Must run before any thread is created: threads
+ * spawned later inherit the namespace. */
+static int
+driver_private_netns(void)
+{
+    struct ifreq ifr;
+    int          fd;
+
+    if (unshare(CLONE_NEWNET) != 0) {
+        return -1;
+    }
+
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, "lo", sizeof(ifr.ifr_name) - 1);
+    if (ioctl(fd, SIOCGIFFLAGS, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+    ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+    if (ioctl(fd, SIOCSIFFLAGS, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+} /* driver_private_netns */
 
 /* Install the requesting model pid's credential and umask on this thread. */
 static void
@@ -740,12 +780,16 @@ main(
 {
     struct chimera_client_config *config;
     struct chimera_posix_client  *posix;
+    struct chimera_server        *server  = NULL;
     struct prometheus_metrics    *metrics;
     struct chimera_vfs_cred       root_cred;
     char                         *line    = NULL;
     size_t                        cap     = 0;
     const char                   *backend = (argc > 1) ? argv[1] : "memfs";
     const char                   *storage = (argc > 2) ? argv[2] : NULL;
+    const char                   *module  = backend;
+    int                           nfs_version = 0;
+    char                          module_cfg[4096];
 
     proto_out = fdopen(dup(STDOUT_FILENO), "w");
     if (!proto_out || dup2(STDERR_FILENO, STDOUT_FILENO) < 0) {
@@ -760,24 +804,29 @@ main(
 
     chimera_vfs_cred_init_unix(&root_cred, 0, 0, 0, NULL);
 
-    /* Backend selection: argv[1] names the VFS module (default memfs),
-    * argv[2] is a scratch directory for backends with real storage. */
-    config = chimera_client_config_init();
+    /* Backend selection: argv[1] names the VFS module (default memfs), or an
+     * NFS loopback path nfs3_<module>/nfs4_<module> (an in-process chimera
+     * server exports the module and the client mounts it over localhost NFS).
+     * argv[2] is a scratch directory for backends with real storage. */
+    if (strncmp(backend, "nfs3_", 5) == 0) {
+        nfs_version = 3;
+        module      = backend + 5;
+    } else if (strncmp(backend, "nfs4_", 5) == 0) {
+        nfs_version = 4;
+        module      = backend + 5;
+    }
 
-    if (strcmp(backend, "memfs") == 0) {
+    /* Backend module configuration, shared by the direct-mount and
+     * NFS-loopback paths. */
+    module_cfg[0] = '\0';
+    if (strcmp(module, "memfs") == 0) {
         /* Align memfs's internal block size with the harness's abstract
          * block size so model holes are real holes (SEEK_HOLE granularity).
          */
-        for (int i = 0; i < config->num_modules; i++) {
-            if (strcmp(config->modules[i].module_name, "memfs") == 0) {
-                snprintf(config->modules[i].config_data,
-                         sizeof(config->modules[i].config_data),
-                         "{\"block_size\": %d}", DRIVER_BLOCK_SIZE);
-            }
-        }
-    } else if (strcmp(backend, "diskfs") == 0) {
+        snprintf(module_cfg, sizeof(module_cfg),
+                 "{\"block_size\": %d}", DRIVER_BLOCK_SIZE);
+    } else if (strcmp(module, "diskfs") == 0) {
         char img[3800];
-        char cfg[4096];
         int  fd;
 
         if (!storage) {
@@ -793,37 +842,98 @@ main(
         }
         close(fd);
         /* 1 GiB sparse device; pin a small (64 MiB) intent log so the
-        * journal fits the scratch device's first allocation group. */
-        snprintf(cfg, sizeof(cfg),
+         * journal fits the scratch device's first allocation group. */
+        snprintf(module_cfg, sizeof(module_cfg),
                  "{\"initialize\":true,\"unsafe_async\":true,"
                  "\"intent_log_size\":67108864,"
                  "\"devices\":[{\"type\":\"libaio\",\"size\":1,\"path\":\"%s\"}]}",
                  img);
-        chimera_client_config_add_module(config, "diskfs", "", cfg);
-    } else if (strcmp(backend, "cairn") == 0) {
-        char cfg[4096];
-
+    } else if (strcmp(module, "cairn") == 0) {
         if (!storage) {
             fprintf(stderr, "posix_driver: cairn needs a storage dir\n");
             return 1;
         }
-        snprintf(cfg, sizeof(cfg),
+        snprintf(module_cfg, sizeof(module_cfg),
                  "{\"initialize\":true,\"path\":\"%s\"}", storage);
-        chimera_client_config_add_module(config, "cairn", "", cfg);
     } else {
         fprintf(stderr, "posix_driver: unknown backend %s\n", backend);
         return 1;
     }
 
-    posix = chimera_posix_init(config, &root_cred, metrics);
-    if (!posix) {
-        fprintf(stderr, "posix_driver: client init failed\n");
-        return 1;
-    }
+    config = chimera_client_config_init();
 
-    if (chimera_posix_mount("/test", backend, "/") != 0) {
-        fprintf(stderr, "posix_driver: %s mount failed\n", backend);
-        return 1;
+    if (nfs_version) {
+        /* Loopback NFS: an in-process server exports the module as /share
+         * inside a private network namespace (default ports, no collisions
+         * with concurrent drivers), and the client mounts it over localhost
+         * NFS via the nfs proxy module. */
+        struct chimera_server_config *server_config;
+        char                          mount_options[64];
+
+        if (driver_private_netns() != 0) {
+            fprintf(stderr, "posix_driver: private netns setup failed: %s\n",
+                    strerror(errno));
+            return 1;
+        }
+
+        server_config = chimera_server_config_init();
+        chimera_server_config_add_module(server_config, module, NULL,
+                                         module_cfg);
+
+        server = chimera_server_init(server_config, metrics);
+        if (!server) {
+            fprintf(stderr, "posix_driver: server init failed\n");
+            return 1;
+        }
+
+        chimera_server_mount(server, "share", module, "/", NULL);
+
+        if (chimera_server_create_export(server, "/share", "/share",
+                                         4242, NULL) != 0) {
+            fprintf(stderr, "posix_driver: export creation failed\n");
+            return 1;
+        }
+
+        chimera_server_start(server);
+
+        posix = chimera_posix_init(config, &root_cred, metrics);
+        if (!posix) {
+            fprintf(stderr, "posix_driver: client init failed\n");
+            return 1;
+        }
+
+        snprintf(mount_options, sizeof(mount_options), "vers=%d",
+                 nfs_version);
+        if (chimera_posix_mount_with_options("/test", "nfs",
+                                             "127.0.0.1:/share",
+                                             mount_options) != 0) {
+            fprintf(stderr, "posix_driver: nfs%d mount failed\n",
+                    nfs_version);
+            return 1;
+        }
+    } else {
+        if (strcmp(module, "memfs") == 0) {
+            for (int i = 0; i < config->num_modules; i++) {
+                if (strcmp(config->modules[i].module_name, "memfs") == 0) {
+                    snprintf(config->modules[i].config_data,
+                             sizeof(config->modules[i].config_data),
+                             "%s", module_cfg);
+                }
+            }
+        } else {
+            chimera_client_config_add_module(config, module, "", module_cfg);
+        }
+
+        posix = chimera_posix_init(config, &root_cred, metrics);
+        if (!posix) {
+            fprintf(stderr, "posix_driver: client init failed\n");
+            return 1;
+        }
+
+        if (chimera_posix_mount("/test", module, "/") != 0) {
+            fprintf(stderr, "posix_driver: %s mount failed\n", backend);
+            return 1;
+        }
     }
 
     /* Normalize the root to the model's fsInit(0777, 0, 0). */
@@ -872,6 +982,9 @@ main(
     free(line);
     chimera_posix_umount("/test");
     chimera_posix_shutdown();
+    if (server) {
+        chimera_server_destroy(server);
+    }
     prometheus_metrics_destroy(metrics);
     return 0;
 } /* main */

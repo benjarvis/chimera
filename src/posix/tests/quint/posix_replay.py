@@ -92,10 +92,25 @@ PROFILE = {
 # pins the same profile, so their traces never skip either.
 DISK_PROFILE = dict(PROFILE, cloneRange=False)
 
+# NFS loopback paths (client -> in-process server -> backend) probed
+# 2026-08-12; identical across the three backends behind each version, so
+# the profiles are version-keyed (posixNfs3/posixNfs4 instances match).
+NFS3_PROFILE = dict(PROFILE, copyRange=False, cloneRange=False,
+                    seekHole=False, strictAtime=True)
+NFS4_PROFILE = dict(PROFILE, copyRange=False, cloneRange=False,
+                    seekHole=True, strictAtime=False,
+                    errUnlinkDirIsdir=False)
+
 PROFILES = {
     "memfs": PROFILE,
     "diskfs": DISK_PROFILE,
     "cairn": DISK_PROFILE,
+    "nfs3_memfs": NFS3_PROFILE,
+    "nfs3_diskfs": NFS3_PROFILE,
+    "nfs3_cairn": NFS3_PROFILE,
+    "nfs4_memfs": NFS4_PROFILE,
+    "nfs4_diskfs": NFS4_PROFILE,
+    "nfs4_cairn": NFS4_PROFILE,
 }
 
 

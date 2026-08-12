@@ -93,6 +93,59 @@ module posixDisk {
     import posixops.* from "./posix_ops"
 }
 
+// The chimera NFS3-loopback profile (client -> in-process server ->
+// backend), pinned to `--probe --backend nfs3_{memfs,diskfs,cairn}` on
+// 2026-08-12: all three backends probe identically behind the server, so one
+// instance serves the three.  No copy/clone offload (the VFS copy fallback
+// refuses proxy handles) and no SEEK_DATA/SEEK_HOLE in the NFS3 protocol;
+// atime propagates strictly (reads refresh it through the wire attributes).
+module posixNfs3 {
+    import posix(
+        F_COPY_RANGE = FeatOff,
+        F_CLONE_RANGE = FeatOff,
+        F_SEEK_HOLE = FeatOff,
+        F_ROOT = FeatIfAdvertised,
+        P_GID_FROM_PARENT = FeatOff,
+        P_SGID_INHERIT = FeatOff,
+        P_WRITE_CLEARS_SETIDS = FeatMandatory,
+        P_PWRITE_APPENDS = FeatOff,
+        P_RENAME_CTIME = FeatMandatory,
+        P_STRICT_ATIME = FeatMandatory,
+        P_STICKY_WRITE_ARM = FeatOff,
+        P_ERR_NOTEMPTY = FeatMandatory,
+        P_ERR_STICKY_ACCES = FeatMandatory,
+        P_ERR_UNLINKDIR_ISDIR = FeatMandatory,
+        P_ERR_LOCK_AGAIN = FeatMandatory
+    ).* from "./posix"
+    import posixops.* from "./posix_ops"
+}
+
+// The chimera NFS4-loopback profile, pinned the same day: again identical
+// across the three backends.  NFS4.2 SEEK backs SEEK_DATA/SEEK_HOLE; atime
+// is not strictly observed; unlink(dir) is pinned to the EPERM reading
+// (P_ERR_UNLINKDIR_ISDIR off) -- the nfs4 client currently maps unlink to a
+// bare REMOVE, which the corpus flags as a real divergence.
+module posixNfs4 {
+    import posix(
+        F_COPY_RANGE = FeatOff,
+        F_CLONE_RANGE = FeatOff,
+        F_SEEK_HOLE = FeatMandatory,
+        F_ROOT = FeatIfAdvertised,
+        P_GID_FROM_PARENT = FeatOff,
+        P_SGID_INHERIT = FeatOff,
+        P_WRITE_CLEARS_SETIDS = FeatMandatory,
+        P_PWRITE_APPENDS = FeatOff,
+        P_RENAME_CTIME = FeatMandatory,
+        P_STRICT_ATIME = FeatOff,
+        P_STICKY_WRITE_ARM = FeatOff,
+        P_ERR_NOTEMPTY = FeatMandatory,
+        P_ERR_STICKY_ACCES = FeatMandatory,
+        P_ERR_UNLINKDIR_ISDIR = FeatOff,
+        P_ERR_LOCK_AGAIN = FeatMandatory
+    ).* from "./posix"
+    import posixops.* from "./posix_ops"
+}
+
 module posixStrict {
     import posix(
         F_COPY_RANGE = FeatMandatory,
