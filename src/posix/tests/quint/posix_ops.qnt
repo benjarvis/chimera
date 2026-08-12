@@ -1375,9 +1375,10 @@ module posixops {
     pure def opCopyRange(fs: Fs, ps: Pstate, caps: Caps, p: Pid, fdIn: Fd,
                          offIn: int, fdOut: Fd, offOut: int,
                          len: int): Out =
-        if (not(caps.copyRange))
-            out(fs, ps, SRw({ e: EOPNOTSUPP, n: 0, syms: [] }))
-        else if (not(fdLive(ps, p, fdIn)) or not(fdLive(ps, p, fdOut)))
+        // Linux orders the descriptor checks before the filesystem-support
+        // check (same as clone_range): copy_file_range's EBADF wins over
+        // EOPNOTSUPP from a backend without copy offload.
+        if (not(fdLive(ps, p, fdIn)) or not(fdLive(ps, p, fdOut)))
             out(fs, ps, SRw({ e: EBADF, n: 0, syms: [] }))
         else {
             val oi = fdOfd(ps, p, fdIn)
@@ -1385,6 +1386,8 @@ module posixops {
             if (not(accReads(oi.acc)) or not(accWrites(oo.acc)) or
                     oo.appendF)
                 out(fs, ps, SRw({ e: EBADF, n: 0, syms: [] }))
+            else if (not(caps.copyRange))
+                out(fs, ps, SRw({ e: EOPNOTSUPP, n: 0, syms: [] }))
             else if (fs.inodes.get(oi.ino).ftype != FReg or
                      fs.inodes.get(oo.ino).ftype != FReg)
                 out(fs, ps, SRw({ e: EINVAL, n: 0, syms: [] }))

@@ -77,11 +77,17 @@ function(posix_mbt_add_batch instance prefix flavor steps ntraces seed)
                         --trace ${trace}
                         --backend ${backend}
                         --driver $<TARGET_FILE:posix_quint_driver>)
+            # NFS-loopback replays add server spin-up and RPC round trips.
+            if(backend MATCHES "^nfs")
+                set(ttimeout 300)
+            else()
+                set(ttimeout 120)
+            endif()
             set_tests_properties(${name} PROPERTIES
                 LABELS "posix_mbt;${backend}"
                 ENVIRONMENT "PYTHONUNBUFFERED=1"
                 SKIP_RETURN_CODE 77
-                TIMEOUT 120)
+                TIMEOUT ${ttimeout})
         endforeach()
     endforeach()
 endfunction()
@@ -100,6 +106,32 @@ posix_mbt_add_batch(posixMemfs "" stepLocks       128  2 0x1   memfs)
 posix_mbt_add_batch(posixMemfs "" stepPerms       128  5 0x1   memfs)
 posix_mbt_add_batch(posixMemfs "" stepLinks       128  5 0x1   memfs)
 posix_mbt_add_batch(posixMemfs "" stepFds         128  5 0x1   memfs)
+
+# NFS loopback paths (client -> in-process server -> backend): the probed
+# profile is version-keyed and identical across the three backends behind
+# each version, so one corpus per NFS version replays against all three.
+posix_mbt_add_batch(posixNfs3 nfs3_ step            128 10 0x1   nfs3_memfs nfs3_diskfs nfs3_cairn)
+posix_mbt_add_batch(posixNfs3 nfs3_ step            128  6 0x2   nfs3_memfs nfs3_diskfs nfs3_cairn)
+posix_mbt_add_batch(posixNfs3 nfs3_ step            256  3 0x100 nfs3_memfs nfs3_diskfs nfs3_cairn)
+posix_mbt_add_batch(posixNfs3 nfs3_ stepNamespace   128  4 0x1   nfs3_memfs nfs3_diskfs nfs3_cairn)
+posix_mbt_add_batch(posixNfs3 nfs3_ stepDescriptors 128  4 0x1   nfs3_memfs nfs3_diskfs nfs3_cairn)
+posix_mbt_add_batch(posixNfs3 nfs3_ stepMetadata    128  4 0x1   nfs3_memfs nfs3_diskfs nfs3_cairn)
+posix_mbt_add_batch(posixNfs3 nfs3_ stepDirs        128  3 0x1   nfs3_memfs nfs3_diskfs nfs3_cairn)
+posix_mbt_add_batch(posixNfs3 nfs3_ stepData        128  4 0x1   nfs3_memfs nfs3_diskfs nfs3_cairn)
+posix_mbt_add_batch(posixNfs3 nfs3_ stepPerms       128  5 0x1   nfs3_memfs nfs3_diskfs nfs3_cairn)
+posix_mbt_add_batch(posixNfs3 nfs3_ stepLinks       128  5 0x1   nfs3_memfs nfs3_diskfs nfs3_cairn)
+posix_mbt_add_batch(posixNfs3 nfs3_ stepFds         128  5 0x1   nfs3_memfs nfs3_diskfs nfs3_cairn)
+posix_mbt_add_batch(posixNfs4 nfs4_ step            128 10 0x1   nfs4_memfs nfs4_diskfs nfs4_cairn)
+posix_mbt_add_batch(posixNfs4 nfs4_ step            128  6 0x2   nfs4_memfs nfs4_diskfs nfs4_cairn)
+posix_mbt_add_batch(posixNfs4 nfs4_ step            256  3 0x100 nfs4_memfs nfs4_diskfs nfs4_cairn)
+posix_mbt_add_batch(posixNfs4 nfs4_ stepNamespace   128  4 0x1   nfs4_memfs nfs4_diskfs nfs4_cairn)
+posix_mbt_add_batch(posixNfs4 nfs4_ stepDescriptors 128  4 0x1   nfs4_memfs nfs4_diskfs nfs4_cairn)
+posix_mbt_add_batch(posixNfs4 nfs4_ stepMetadata    128  4 0x1   nfs4_memfs nfs4_diskfs nfs4_cairn)
+posix_mbt_add_batch(posixNfs4 nfs4_ stepDirs        128  3 0x1   nfs4_memfs nfs4_diskfs nfs4_cairn)
+posix_mbt_add_batch(posixNfs4 nfs4_ stepData        128  4 0x1   nfs4_memfs nfs4_diskfs nfs4_cairn)
+posix_mbt_add_batch(posixNfs4 nfs4_ stepPerms       128  5 0x1   nfs4_memfs nfs4_diskfs nfs4_cairn)
+posix_mbt_add_batch(posixNfs4 nfs4_ stepLinks       128  5 0x1   nfs4_memfs nfs4_diskfs nfs4_cairn)
+posix_mbt_add_batch(posixNfs4 nfs4_ stepFds         128  5 0x1   nfs4_memfs nfs4_diskfs nfs4_cairn)
 
 # diskfs and cairn probe identically (memfs profile minus clone_range), so
 # one posixDisk trace corpus replays against both backends.

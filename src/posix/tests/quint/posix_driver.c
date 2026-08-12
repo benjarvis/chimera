@@ -780,14 +780,14 @@ main(
 {
     struct chimera_client_config *config;
     struct chimera_posix_client  *posix;
-    struct chimera_server        *server  = NULL;
+    struct chimera_server        *server = NULL;
     struct prometheus_metrics    *metrics;
     struct chimera_vfs_cred       root_cred;
-    char                         *line    = NULL;
-    size_t                        cap     = 0;
-    const char                   *backend = (argc > 1) ? argv[1] : "memfs";
-    const char                   *storage = (argc > 2) ? argv[2] : NULL;
-    const char                   *module  = backend;
+    char                         *line        = NULL;
+    size_t                        cap         = 0;
+    const char                   *backend     = (argc > 1) ? argv[1] : "memfs";
+    const char                   *storage     = (argc > 2) ? argv[2] : NULL;
+    const char                   *module      = backend;
     int                           nfs_version = 0;
     char                          module_cfg[4096];
 
@@ -842,7 +842,7 @@ main(
         }
         close(fd);
         /* 1 GiB sparse device; pin a small (64 MiB) intent log so the
-         * journal fits the scratch device's first allocation group. */
+        * journal fits the scratch device's first allocation group. */
         snprintf(module_cfg, sizeof(module_cfg),
                  "{\"initialize\":true,\"unsafe_async\":true,"
                  "\"intent_log_size\":67108864,"
