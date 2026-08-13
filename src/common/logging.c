@@ -142,6 +142,13 @@ pthread_mutex_t    ChimeraLogBufLock  = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t    ChimeraLogFlushLock = PTHREAD_MUTEX_INITIALIZER;
 pthread_t          ChimeraLogThread;
 pthread_once_t     ChimeraLogOnce = PTHREAD_ONCE_INIT;
+/* When set, a stopping flusher frees the buffers and closes the log file
+ * (real teardown at exit/fatal).  The atfork prepare handler stops the
+ * flusher WITHOUT teardown so the parent can restart it after fork. */
+static int         ChimeraLogTeardown = 1;
+/* Set by the atfork prepare handler when it stopped a running flusher, so
+ * the parent-side handler knows to restart it. */
+static int         ChimeraLogForkStopped;
 
 static void *
 chimera_log_thread(void *arg)
@@ -169,6 +176,12 @@ chimera_log_thread(void *arg)
             pthread_mutex_unlock(&ChimeraLogFlushLock);
         }
         usleep(1000);
+    }
+
+    if (!ChimeraLogTeardown) {
+        /* Stopped by the atfork prepare handler: the buffers stay live so
+         * the parent-side handler can restart the flusher after fork. */
+        return NULL;
     }
 
     /* Clear the pointers under the lock so a straggling chimera_vlog()
@@ -218,9 +231,33 @@ chimera_log_flush_signal(int signum)
 static void
 chimera_log_atfork_prepare(void)
 {
-    /* FlushLock first (same order as the flusher): holding it across fork()
-     * guarantees the flusher is not mid-fprintf/fflush, so the child cannot
-     * inherit the C library's stream lock in a taken state. */
+    /* Stop and JOIN the flusher across fork(): holding FlushLock across the
+     * fork (the previous approach) keeps the flusher out of fprintf/fflush,
+     * but it can still be inside a lock this code cannot see -- observed in
+     * practice as the sanitizer allocator's per-size-class region mutex,
+     * taken inside the malloc/free that glibc stdio does under the flusher's
+     * own locks.  gcc-13's ASan does not force-unlock those region locks
+     * across fork, so a child forked at the wrong instant inherits one
+     * locked, and every thread the child later creates wedges inside
+     * AsanThread::Init on its first allocation (the lock-family CI flakes
+     * in #733).  With the flusher joined, the forking thread is the only
+     * thread this library contributes at fork time, so no lock it takes --
+     * visible or hidden -- can be inherited mid-flight.  The parent-side
+     * handler restarts the thread; the buffers stay live throughout
+     * (ChimeraLogTeardown is cleared so the exiting thread skips its
+     * end-of-life free/close). */
+    ChimeraLogForkStopped = 0;
+    if (ChimeraLogRun) {
+        ChimeraLogTeardown = 0;
+        ChimeraLogRun      = 0;
+        pthread_join(ChimeraLogThread, NULL);
+        ChimeraLogTeardown    = 1;
+        ChimeraLogForkStopped = 1;
+    }
+
+    /* Still take the buffer locks: other application threads may be inside
+     * chimera_vlog() at fork time, and the child must not inherit the log
+     * buffer mid-append. */
     pthread_mutex_lock(&ChimeraLogFlushLock);
     pthread_mutex_lock(&ChimeraLogBufLock);
 } /* chimera_log_atfork_prepare */
@@ -228,8 +265,24 @@ chimera_log_atfork_prepare(void)
 static void
 chimera_log_atfork_parent(void)
 {
+    int rc;
+
     pthread_mutex_unlock(&ChimeraLogBufLock);
     pthread_mutex_unlock(&ChimeraLogFlushLock);
+
+    if (ChimeraLogForkStopped) {
+        ChimeraLogRun = 1;
+        rc            = chimera_pthread_create(&ChimeraLogThread, NULL,
+                                               chimera_log_thread, NULL);
+        if (rc != 0) {
+            /* Same contract as chimera_log_thread_init: without a flusher
+             * the buffer would fill and stall every logger. */
+            fprintf(stderr,
+                    "chimera_log_atfork_parent: pthread_create failed: %s\n",
+                    strerror(rc));
+            abort();
+        }
+    }
 } /* chimera_log_atfork_parent */
 
 static void
@@ -247,7 +300,8 @@ chimera_log_atfork_child(void)
      */
     pthread_mutex_init(&ChimeraLogBufLock, NULL);
     pthread_mutex_init(&ChimeraLogFlushLock, NULL);
-    ChimeraLogRun = 0;
+    ChimeraLogRun         = 0;
+    ChimeraLogForkStopped = 0;
 
     if (ChimeraLogBuf) {
         ChimeraLogBufPtr = ChimeraLogBuf;
@@ -306,6 +360,28 @@ SYMBOL_EXPORT void
 chimera_log_init(void)
 {
     pthread_once(&ChimeraLogOnce, chimera_log_thread_init);
+
+    /* In a fork()ed child the once above is already consumed but the
+    * parent's flusher does not survive the fork (the atfork child handler
+    * leaves ChimeraLogRun clear), so a child that initializes its own
+    * client would otherwise buffer logs with nothing draining them.
+    * Restart a flusher lazily; BufLock serializes racing callers. */
+    if (!ChimeraLogDisabled && !ChimeraLogRun && ChimeraLogBuffers[0]) {
+        pthread_mutex_lock(&ChimeraLogBufLock);
+        if (!ChimeraLogRun && ChimeraLogBuffers[0]) {
+            int rc;
+
+            ChimeraLogRun = 1;
+            rc            = chimera_pthread_create(&ChimeraLogThread, NULL,
+                                                   chimera_log_thread, NULL);
+            if (rc != 0) {
+                fprintf(stderr, "chimera_log_init: pthread_create failed: %s\n",
+                        strerror(rc));
+                abort();
+            }
+        }
+        pthread_mutex_unlock(&ChimeraLogBufLock);
+    }
 } /* chimera_log_init */
 
 SYMBOL_EXPORT void
