@@ -98,6 +98,8 @@ chimera_vfs_state_init(void)
     state->default_break_deadline_ms = CHIMERA_VFS_STATE_DEFAULT_BREAK_DEADLINE_MS;
     state->implicit_idle_ms          = CHIMERA_VFS_STATE_DEFAULT_IMPLICIT_IDLE_MS;
 
+    pthread_mutex_init(&state->occupied_lock, NULL);
+
     return state;
 } /* chimera_vfs_state_init */
 
@@ -126,6 +128,8 @@ chimera_vfs_state_destroy(struct chimera_vfs_state *state)
         pthread_mutex_destroy(&state->buckets[i].lock);
     }
 
+    pthread_mutex_destroy(&state->occupied_lock);
+    free(state->reap_snap);
     free(state);
 } /* chimera_vfs_state_destroy */
 
@@ -197,6 +201,20 @@ chimera_vfs_state_get(
     file->bucket_next = bucket->files;
     bucket->files     = file;
 
+    /* First file in this bucket: link it onto the occupied list so the
+     * reap sweep will visit it.  occupied_lock nests inside bucket->lock. */
+    if (!bucket->occupied) {
+        pthread_mutex_lock(&state->occupied_lock);
+        bucket->occupied = 1;
+        bucket->occ_prev = NULL;
+        bucket->occ_next = state->occupied;
+        if (state->occupied) {
+            state->occupied->occ_prev = bucket;
+        }
+        state->occupied = bucket;
+        pthread_mutex_unlock(&state->occupied_lock);
+    }
+
     pthread_mutex_unlock(&bucket->lock);
     return file;
 } /* chimera_vfs_state_get */
@@ -249,6 +267,24 @@ chimera_vfs_state_put(
             *link = file->bucket_next;
             break;
         }
+    }
+
+    /* Last file gone: drop the bucket from the occupied list so the reap
+     * sweep stops visiting it. */
+    if (bucket->files == NULL && bucket->occupied) {
+        pthread_mutex_lock(&state->occupied_lock);
+        bucket->occupied = 0;
+        if (bucket->occ_prev) {
+            bucket->occ_prev->occ_next = bucket->occ_next;
+        } else {
+            state->occupied = bucket->occ_next;
+        }
+        if (bucket->occ_next) {
+            bucket->occ_next->occ_prev = bucket->occ_prev;
+        }
+        bucket->occ_next = NULL;
+        bucket->occ_prev = NULL;
+        pthread_mutex_unlock(&state->occupied_lock);
     }
 
     pthread_mutex_unlock(&bucket->lock);
@@ -3947,11 +3983,42 @@ chimera_vfs_state_reap_idle(
     uint64_t                  idle_ms)
 {
 #define CHIMERA_VFS_STATE_REAP_BATCH 64
-    uint64_t now = chimera_vfs_now_ticks();
-    int      b;
+    uint64_t                         now = chimera_vfs_now_ticks();
+    struct chimera_vfs_state_bucket *occ;
+    uint32_t                         nsnap;
+    uint32_t                         b;
 
-    for (b = 0; b < CHIMERA_VFS_STATE_NUM_BUCKETS; b++) {
-        struct chimera_vfs_state_bucket *bucket = &state->buckets[b];
+    /* Snapshot the occupied buckets, then sweep from the snapshot with no
+     * list lock held (lock order is bucket->lock -> occupied_lock, so the
+     * per-bucket locks below may not be taken under occupied_lock).  The
+     * bucket array is never freed, so a snapshotted bucket that empties
+     * concurrently just yields no candidates; one that fills right after
+     * the snapshot is picked up on the next sweep.  Sweeping only occupied
+     * buckets keeps the periodic timer proportional to live state instead
+     * of walking all 2^20 buckets every 100ms. */
+    for (;;) {
+        nsnap = 0;
+        pthread_mutex_lock(&state->occupied_lock);
+        for (occ = state->occupied; occ; occ = occ->occ_next) {
+            if (nsnap == state->reap_snap_cap) {
+                break;
+            }
+            state->reap_snap[nsnap++] = occ;
+        }
+        if (!occ) {
+            pthread_mutex_unlock(&state->occupied_lock);
+            break;
+        }
+        /* Snapshot buffer too small: grow it outside the lock and retry. */
+        pthread_mutex_unlock(&state->occupied_lock);
+        state->reap_snap_cap = state->reap_snap_cap ? state->reap_snap_cap * 2 : 64;
+        state->reap_snap     = realloc(state->reap_snap,
+                                       state->reap_snap_cap * sizeof(*state->reap_snap));
+        chimera_vfs_abort_if(!state->reap_snap, "reap snapshot allocation failed");
+    }
+
+    for (b = 0; b < nsnap; b++) {
+        struct chimera_vfs_state_bucket *bucket = state->reap_snap[b];
         struct chimera_vfs_file_state   *cand[CHIMERA_VFS_STATE_REAP_BATCH];
         struct chimera_vfs_file_state   *file;
         int                              n = 0;

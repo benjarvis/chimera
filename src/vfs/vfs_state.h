@@ -109,18 +109,37 @@ struct chimera_vfs_file_state {
 };
 
 struct chimera_vfs_state_bucket {
-    struct chimera_vfs_file_state *files;
-    pthread_mutex_t                lock;
+    struct chimera_vfs_file_state   *files;
+    pthread_mutex_t                  lock;
+    /* Membership in state->occupied (buckets holding at least one file), so
+     * the periodic reap sweep visits only populated buckets rather than all
+     * 2^20 (a full sweep costs ~50ms under ASan and runs 10x/sec, pinning
+     * the close thread).  All three fields are guarded by
+     * state->occupied_lock, which nests inside bucket->lock; membership
+     * transitions happen only while bucket->lock is also held, so the
+     * occupied flag is stable wherever bucket->lock is held. */
+    struct chimera_vfs_state_bucket *occ_next;
+    struct chimera_vfs_state_bucket *occ_prev;
+    uint8_t                          occupied;
 };
 
 struct chimera_vfs_state {
-    struct chimera_vfs_state_bucket buckets[CHIMERA_VFS_STATE_NUM_BUCKETS];
+    struct chimera_vfs_state_bucket   buckets[CHIMERA_VFS_STATE_NUM_BUCKETS];
     /* Default deadline applied by chimera_vfs_lease_begin_break() when the
      * caller passes 0.  Matches SMB2 lease-break timeout convention. */
-    uint32_t                        default_break_deadline_ms;
+    uint32_t                          default_break_deadline_ms;
     /* Implicit leases held this long without any I/O are dropped by
      * chimera_vfs_state_reap_idle(). */
-    uint32_t                        implicit_idle_ms;
+    uint32_t                          implicit_idle_ms;
+    /* Buckets currently holding files, plus a persistent snapshot buffer the
+     * reap sweep copies them into (the sweep drops occupied_lock before
+     * taking bucket locks, keeping lock order bucket->lock ->
+     * occupied_lock everywhere; bucket structs are never freed, so a
+     * snapshotted bucket that empties concurrently just yields nothing). */
+    pthread_mutex_t                   occupied_lock;
+    struct chimera_vfs_state_bucket  *occupied;
+    struct chimera_vfs_state_bucket **reap_snap;
+    uint32_t                          reap_snap_cap;
 };
 
 /* -------------------------------------------------------------------- */
