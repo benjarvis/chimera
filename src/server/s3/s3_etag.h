@@ -65,6 +65,10 @@ chimera_s3_attach_etag(
 {
     char hex[80];
 
+    if (!request) {
+        return;
+    }
+
     chimera_s3_etag_hex(hex, sizeof(hex), attr);
 
     evpl_http_request_add_header(request, "ETag", hex);
