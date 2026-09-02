@@ -250,6 +250,14 @@ chimera_smb_client_read(
         return;
     }
 
+    /* POSIX read() on a directory is EISDIR; SMB would answer a generic
+     * INVALID_PARAMETER (EINVAL), so classify it from the handle. */
+    if (open_state->is_directory) {
+        request->status = CHIMERA_VFS_EISDIR;
+        request->complete(request);
+        return;
+    }
+
     if (request->read.length == 0) {
         request->read.r_length = 0;
         request->read.r_eof    = 0;
@@ -415,6 +423,12 @@ chimera_smb_client_write(
 
     if (!open_state) {
         request->status = CHIMERA_VFS_EINVAL;
+        request->complete(request);
+        return;
+    }
+
+    if (open_state->is_directory) {
+        request->status = CHIMERA_VFS_EISDIR;
         request->complete(request);
         return;
     }
