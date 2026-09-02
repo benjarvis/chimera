@@ -1458,6 +1458,12 @@ posix_env_setup(
          * the export to. */
         if (smb) {
             chimera_server_config_set_smb_enabled(server_config, 1);
+            /* Report the POSIX mode as a modefromsid ACE on QUERY SECURITY so
+             * the proxy reads the exact mode back (matching a Linux CIFS mount
+             * with modefromsid), rather than the Windows ACL memfs synthesizes
+             * from the mode -- which the proxy's engine DAC gate would then
+             * misjudge. */
+            chimera_server_config_set_smb_mode_from_sid(server_config, 1);
         } else {
             chimera_server_config_set_nfs_enabled(server_config, 1);
         }
@@ -1632,8 +1638,8 @@ posix_env_setup(
     g_smb         = smb;
     g_strict_dac  = nfs_version != 0 || posix_module_is_passthrough(module);
     g_root_cred   = root_cred;
-    g_server  = server;
-    g_metrics = metrics;
+    g_server      = server;
+    g_metrics     = metrics;
 
     /* Normalize the root to the model's fsInit(0777, 0, 0). */
     if (normalize_root() != 0) {
