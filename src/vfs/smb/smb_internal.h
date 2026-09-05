@@ -9,6 +9,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <openssl/evp.h>
 
 #include "vfs/sdk/chimera_vfs_sdk.h"
 #include "common/tcp_flavor.h"
@@ -18,7 +19,10 @@
 #include "evpl/evpl.h"
 #include "common/logging.h"
 #include "common/evpl_iovec_cursor.h"
-#include "server/smb/smb2.h"
+#include "smb_common/smb2.h"
+#include "smb_common/smb_signing.h"
+#include "smb_common/smb_encrypt.h"
+#include "smb_common/smb_compress.h"
 #include "smb_ntlm.h"
 
 #define chimera_smbclient_debug(...) chimera_debug("smbclient", __FILE__, __LINE__, __VA_ARGS__)
@@ -175,6 +179,19 @@ struct chimera_smb_client_server {
      * a modern server never negotiates anything but 3.1.1. */
     uint16_t              forced_dialect;
 
+    /* seal= from the mount options: 1 asks for transport encryption, 0 leaves
+     * it to the server to demand.  Offering a cipher costs nothing when the
+     * server does not want one, but a client that never offers cannot be
+     * encrypted at all, which is how this module behaved before seal existed. */
+    int                   seal_requested;
+
+    /* compress= from the mount options.  Advertising LZ77 is only half of it:
+     * this server compresses nothing unless a READ carries
+     * SMB2_READFLAG_REQUEST_COMPRESSED, so the flag below is also what makes
+     * the client ask, read by read. */
+    int                   compress_requested;
+    int                   compress_active;
+
     struct evpl_endpoint *endpoint;
 
     /* Shared session state, written once by the mount handshake. */
@@ -200,6 +217,27 @@ struct chimera_smb_client_server {
     int                   signing_active;
     uint16_t              signing_alg;
     uint8_t               signing_key[16];
+
+    /* SMB3 transport encryption, derived alongside the signing key and shared
+     * by every per-thread connection (the cipher keys are per-SESSION).
+     *
+     *   cipher_id       the cipher the server selected, 0 if none was
+     *                   negotiated -- which is also how "this session is not
+     *                   encrypted" is spelled.
+     *   enc_key         client -> server (SMBC2SCipherKey / "ServerIn ")
+     *   dec_key         server -> client (SMBS2CCipherKey / "ServerOut")
+     *   encrypt_active  the server told us to encrypt this session
+     *                   (SMB2_SESSION_FLAG_ENCRYPT_DATA), or the mount asked
+     *                   for it with seal=yes.
+     *   nonce_counter   strictly monotonic per session and never reused; every
+     *                   sender-side message consumes one.  Atomic because
+     *                   per-thread connections share the session. */
+    uint16_t              cipher_id;
+    int                   encrypt_active;
+    size_t                enc_key_len;
+    uint8_t               enc_key[32];
+    uint8_t               dec_key[32];
+    _Atomic uint64_t      nonce_counter;
 };
 
 struct chimera_smb_client_shared {
@@ -297,12 +335,12 @@ struct chimera_smb_client_conn {
     struct chimera_smb_client_server   *server;
 
     enum chimera_smb_client_conn_state  state;
-    int                                 closing;   /* evpl_close already issued  */
+    int                                 closing;    /* evpl_close already issued  */
 
     uint64_t                            next_message_id;
 
-    struct chimera_smb_client_pending  *pending;   /* in-flight, by message_id  */
-    struct chimera_smb_client_deferred *deferred;  /* queued until READY        */
+    struct chimera_smb_client_pending  *pending;    /* in-flight, by message_id  */
+    struct chimera_smb_client_deferred *deferred;    /* queued until READY        */
 
     /* All connections a thread owns are linked here so thread teardown can
      * detach every one (the DISCONNECTED notify that frees a conn is deferred to
@@ -322,6 +360,16 @@ struct chimera_smb_client_conn {
     uint8_t                             preauth_hash[SMB2_PREAUTH_HASH_SIZE];
     uint16_t                            negotiated_dialect;
     uint16_t                            negotiated_signing_alg;
+    uint16_t                            negotiated_cipher_id;
+
+    /* AEAD scratch for this connection's transform wrap/unwrap.  Allocated
+     * lazily the first time the session actually encrypts. */
+    struct chimera_smb_encrypt_ctx     *enc_ctx;
+
+    /* AEAD / codec scratch for this connection's transform wrap and unwrap.
+    * Both are per-connection because their EVP contexts are not thread-safe,
+    * and both are allocated lazily the first time the session needs one. */
+    struct chimera_smb_compress_ctx    *cmp_ctx;
 };
 
 struct chimera_smb_client_thread {

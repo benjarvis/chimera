@@ -494,6 +494,88 @@ probe_pin_parent_handle_ops(void)
     probe_ok("mknod below the mount root (SD5 fixed)", probe_call(res));
 } /* probe_pin_parent_handle_ops */
 
+/* A read big enough, and compressible enough, that the server actually sends a
+ * COMPRESSION_TRANSFORM back.  Without this the compression cells would be
+ * vacuous: chimera compresses only a READ reply, only when the client asked,
+ * and only when the payload actually shrinks -- so a probe whose largest read
+ * is three bytes would negotiate compression and then never exercise a byte of
+ * the decoder.
+ *
+ * The payload is a repeating pattern (highly compressible) and is verified byte
+ * for byte after the round trip, because a decoder that silently produces the
+ * wrong bytes is the failure mode that matters. */
+#define PROBE_BLOB_LEN 16384
+
+static void
+probe_compressible_roundtrip(void)
+{
+    static const char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char             *payload;
+    json_t           *res;
+    long long         fd;
+    int               i;
+
+    /* base64 of a repeating byte pattern: 4 chars per 3 bytes, and any constant
+     * quad decodes to a repeating triple, which is what makes it compress. */
+    payload = malloc(PROBE_BLOB_LEN + 1);
+    if (!payload) {
+        probe_fail("compressible payload", "out of memory");
+        return;
+    }
+    for (i = 0; i < PROBE_BLOB_LEN; i++) {
+        payload[i] = b64[(i / 64) % 64];
+    }
+    payload[PROBE_BLOB_LEN] = '\0';
+
+    res = op_open("/test/blob", O_CREAT | O_RDWR, 0644);
+    fd  = probe_ret(res);
+    json_decref(res);
+    if (fd < 0) {
+        probe_fail("compressible roundtrip", "could not create the file");
+        free(payload);
+        return;
+    }
+
+    res = probe_req("write");
+    probe_set_int(res, "fd", (int) fd);
+    probe_set_str(res, "data", payload);
+    res = probe_call(res);
+    if (probe_ret(res) <= 0) {
+        probe_fail("compressible write", "wrote nothing");
+        json_decref(res);
+        json_decref(op_fd("close", (int) fd));
+        free(payload);
+        return;
+    }
+    json_decref(res);
+
+    /* One large pread: this is the request that carries
+     * SMB2_READFLAG_REQUEST_COMPRESSED and draws the compressed reply. */
+    res = probe_req("pread");
+    probe_set_int(res, "fd", (int) fd);
+    probe_set_int(res, "off", 0);
+    probe_set_int(res, "len", PROBE_BLOB_LEN);
+    res = probe_call(res);
+
+    if (probe_ret(res) <= 0) {
+        probe_fail("compressible read", "read nothing back");
+    } else {
+        const char *got = json_string_value(json_object_get(res, "data"));
+
+        if (!got) {
+            probe_fail("compressible read", "no data in the response");
+        } else if (strcmp(got, payload) != 0) {
+            probe_fail("compressible read",
+                       "the round-tripped bytes differ from what was written");
+        }
+    }
+    json_decref(res);
+
+    probe_ok("compressible roundtrip close", op_fd("close", (int) fd));
+    free(payload);
+} /* probe_compressible_roundtrip */
+
 /* ---- driver ------------------------------------------------------------- */
 
 int
@@ -501,10 +583,40 @@ main(
     int    argc,
     char **argv)
 {
-    const char *vers        = (argc > 1 && argv[1][0]) ? argv[1] : NULL;
-    int         expect_fail = (argc > 2 &&
-                               strcmp(argv[2], "expect-mount-failure") == 0);
+    const char *vers        = NULL;
+    int         expect_fail = 0;
     json_t     *res;
+    int         i;
+
+    /* Flags describe the WIRE the probe runs over: --vers pins the client's
+     * dialect, the rest configure what the in-process server demands.  Any
+     * combination may be declared --expect-mount-failure, which inverts the
+     * verdict: the mount must be refused, and the body never runs. */
+    for (i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--vers=", 7) == 0) {
+            vers = argv[i][7] ? argv[i] + 7 : NULL;
+        } else if (strcmp(argv[i], "--sign-required") == 0) {
+            g_smb_sign_required = 1;
+        } else if (strcmp(argv[i], "--encrypt") == 0) {
+            g_smb_encryption = 1;
+        } else if (strcmp(argv[i], "--encrypt-required") == 0) {
+            g_smb_encryption = 2;
+        } else if (strcmp(argv[i], "--compress") == 0) {
+            g_smb_compression = 1;
+        } else if (strcmp(argv[i], "--seal") == 0) {
+            g_smb_seal = 1;
+        } else if (strcmp(argv[i], "--client-compress") == 0) {
+            g_smb_client_compress = 1;
+        } else if (strcmp(argv[i], "--leases") == 0) {
+            g_smb_leases = 1;
+        } else if (strcmp(argv[i], "--expect-mount-failure") == 0) {
+            expect_fail            = 1;
+            g_expect_mount_failure = 1;
+        } else {
+            fprintf(stderr, "smb_loopback_probe: unknown flag '%s'\n", argv[i]);
+            return 1;
+        }
+    }
 
     /* Optional argv[1] pins the mount's dialect (a vers= value).  With no
      * argument the client offers its whole set and the server selects, which
@@ -538,9 +650,20 @@ main(
 
     if (posix_env_setup("smb_memfs", NULL) != 0) {
         if (expect_fail) {
-            printf("smb_loopback_probe: vers=%s refused the mount, as expected\n",
-                   vers);
-            return 0;
+            printf("smb_loopback_probe: the mount was refused, as expected\n");
+            fflush(stdout);
+            /* _exit skips the log's own flush, and the refusal cells are
+             * exactly the ones whose artifact should say WHY the mount was
+             * refused, so push the buffered lines out first. */
+            chimera_log_flush();
+            /* _exit, not return: the verdict is in, and everything after this
+             * point is teardown of a half-built environment -- a running
+             * server, a client with no mount, evpl thread pools on both.  That
+             * teardown is where the hazards are (it has aborted on Linux and
+             * raced on macOS), and none of it can change the answer.  Leaving
+             * by the shortest path makes the result of this test depend on the
+             * refusal alone. */
+            _exit(0);
         }
         fprintf(stderr, "smb_loopback_probe: SMB loopback setup failed (vers=%s)\n",
                 vers ? vers : "<negotiated>");
@@ -549,9 +672,9 @@ main(
 
     if (expect_fail) {
         fprintf(stderr,
-                "smb_loopback_probe: vers=%s mounted, but this dialect is not "
-                "one the client can carry -- either it gained support (update "
-                "the test) or vers= was ignored\n", vers);
+                "smb_loopback_probe: the mount SUCCEEDED but was expected to be "
+                "refused -- either the client gained the capability the server "
+                "demanded (update the test) or the demand was not applied\n");
         return 1;
     }
 
@@ -563,6 +686,7 @@ main(
     probe_pin_symlink();
     probe_pin_no_posix_metadata();
     probe_pin_parent_handle_ops();
+    probe_compressible_roundtrip();
 
     /* The per-trace recycle: client umount, share/filesystem cycle, remount.
      * The MBT batch leans on this between every trace, so prove it works even

@@ -75,6 +75,27 @@
  * binary covers the whole dialect matrix. */
 static const char                *g_smb_vers;
 
+/* Wire policy the in-process SMB SERVER is configured with, for the loopback
+ * matrix.  These are server demands, not client capabilities: the point of
+ * varying them is to find out what the client does when the far end insists on
+ * something.  Set BEFORE posix_env_setup; defaults match the server's own
+ * (everything off).  See smb_loopback_probe.c for what each combination is
+ * expected to prove. */
+static int                        g_smb_sign_required;  /* advertise SIGNING_REQUIRED */
+static int                        g_smb_encryption;     /* 0 off, 1 offer, 2 require   */
+static int                        g_smb_compression;    /* offer compression           */
+static int                        g_smb_leases;         /* grant oplocks + leases      */
+static int                        g_smb_seal;           /* client asks to encrypt      */
+static int                        g_smb_client_compress; /* client asks to compress    */
+
+/* Set when the CALLER's expected result is a refused mount.  A refused mount
+* leaves a half-built environment -- a running server, a client with no mount,
+* evpl pools on both -- and unwinding that is the hazardous part, not the
+* refusal itself.  A caller whose verdict is already decided sets this and
+* _exit()s instead, which cannot abort on any platform.  See
+* posix_env_setup_unwind for what is being skipped and why it is a hazard. */
+static int                        g_expect_mount_failure;
+
 static struct chimera_vfs_cred    driver_creds[MAX_PIDS];
 static mode_t                     driver_umasks[MAX_PIDS];
 static CHIMERA_DIR               *driver_dirs[MAX_DIRS];
@@ -143,10 +164,16 @@ smb_mount_options(
     char  *buf,
     size_t cap)
 {
+    int n = snprintf(buf, cap, "%s", SMB_LOOPBACK_OPTS);
+
     if (g_smb_vers) {
-        snprintf(buf, cap, "%s,vers=%s", SMB_LOOPBACK_OPTS, g_smb_vers);
-    } else {
-        snprintf(buf, cap, "%s", SMB_LOOPBACK_OPTS);
+        n += snprintf(buf + n, cap - n, ",vers=%s", g_smb_vers);
+    }
+    if (g_smb_seal) {
+        n += snprintf(buf + n, cap - n, ",seal=yes");
+    }
+    if (g_smb_client_compress) {
+        snprintf(buf + n, cap - n, ",compress=yes");
     }
     return buf;
 } /* smb_mount_options */
@@ -1458,6 +1485,14 @@ posix_env_setup(
          * the export to. */
         if (smb) {
             chimera_server_config_set_smb_enabled(server_config, 1);
+            chimera_server_config_set_smb_signing_required(server_config,
+                                                           g_smb_sign_required);
+            chimera_server_config_set_smb_encryption(server_config,
+                                                     g_smb_encryption);
+            chimera_server_config_set_smb_compression(server_config,
+                                                      g_smb_compression);
+            chimera_server_config_set_smb_oplocks(server_config, g_smb_leases);
+            chimera_server_config_set_smb_leases(server_config, g_smb_leases);
             /* Report the POSIX mode as a modefromsid ACE on QUERY SECURITY so
              * the proxy reads the exact mode back (matching a Linux CIFS mount
              * with modefromsid), rather than the Windows ACL memfs synthesizes
@@ -1552,7 +1587,9 @@ posix_env_setup(
                                       sizeof(smb_options))) != 0) {
                 fprintf(stderr, "posix_driver: smb mount failed: %s\n",
                         strerror(errno));
-                posix_env_setup_unwind(server, metrics);
+                if (!g_expect_mount_failure) {
+                    posix_env_setup_unwind(server, metrics);
+                }
                 return 1;
             }
         } else {
@@ -1563,7 +1600,9 @@ posix_env_setup(
                                                  mount_options) != 0) {
                 fprintf(stderr, "posix_driver: nfs%d mount failed\n",
                         nfs_version);
-                posix_env_setup_unwind(server, metrics);
+                if (!g_expect_mount_failure) {
+                    posix_env_setup_unwind(server, metrics);
+                }
                 return 1;
             }
         }

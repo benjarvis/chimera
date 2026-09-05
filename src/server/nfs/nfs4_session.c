@@ -12,6 +12,7 @@
 #include "nfs4_state.h"
 #include "nfs4_callback.h"
 #include "nfs4_drc.h"
+#include "nfs_drc_reply.h"
 #include "nfs_internal.h"
 #include "nfs_nlm_state.h"
 #include "nfs_common.h"
@@ -647,10 +648,11 @@ nfs4_client_setclientid(
 
 nfsstat4
 nfs4_client_setclientid_confirm(
-    struct nfs4_client_table *table,
-    uint64_t                  clientid,
-    const uint8_t            *confirm,
-    struct nfs_client       **destroy_unified)
+    struct nfs4_client_table           *table,
+    uint64_t                            clientid,
+    const uint8_t                      *confirm,
+    const struct nfs4_client_principal *principal,
+    struct nfs_client                 **destroy_unified)
 {
     struct nfs4_client *r, *old;
     nfsstat4            status;
@@ -674,6 +676,17 @@ nfs4_client_setclientid_confirm(
          * specifies NFS4ERR_STALE_CLIENTID here; NFS4ERR_STALE_STATEID is only
          * valid for stateid operations. */
         status = NFS4ERR_STALE_CLIENTID;
+        goto out_unlock;
+    }
+
+    /* RFC 7530 §16.34.5: in every case where the confirm names an existing
+     * record, "if the principals of the records do not match that of the
+     * SETCLIENTID_CONFIRM, the server returns NFS4ERR_CLID_INUSE".  Without
+     * it a principal that learns the {clientid, confirm verifier} pair --
+     * the confirm verifiers being a monotonic counter -- can confirm, and on
+     * a reboot record supersede, a client it did not create. */
+    if (!nfs4_principal_matches(r, principal)) {
+        status = NFS4ERR_CLID_INUSE;
         goto out_unlock;
     }
 
@@ -1514,22 +1527,29 @@ nfs4_replay_capture_reply(
     const struct evpl_iovec *iov,
     int                      niov,
     int                      total_length,
+    uint32_t                 rpc_offset,
     void                    *private_data)
 {
     struct nfs_request      *req     = private_data;
     struct nfs4_session     *session = req->replay_session;
     struct nfs4_replay_slot *slot    = req->replay_slot;
     uint8_t                 *buf;
-    size_t                   offset = 0;
-    size_t                   total  = (size_t) total_length;
+    uint32_t                 rpc_len;
+    size_t                   total;
     size_t                   cur;
-    int                      i;
 
-    if (!slot || !session || total_length <= 0) {
+    if (!slot || !session || total_length <= (int) rpc_offset) {
         return;
     }
 
-    if ((uint32_t) total_length > session->replay_maxresp_cached) {
+    /* Store the RPC reply, not the whole outgoing message: rpc_offset bytes of
+     * transport framing are rebuilt for the retransmit anyway, and keeping them
+     * made a reply captured over RDMA unparseable on replay -- which
+     * nfs4_send_cached_reply's caller turns into a fatal abort. */
+    rpc_len = (uint32_t) total_length - rpc_offset;
+    total   = rpc_len;
+
+    if (rpc_len > session->replay_maxresp_cached) {
         return;
     }
 
@@ -1546,7 +1566,7 @@ nfs4_replay_capture_reply(
                  &session->replay_bytes_in_use, &cur, cur + total,
                  memory_order_relaxed, memory_order_relaxed));
 
-    buf = malloc(total_length);
+    buf = malloc(rpc_len);
     if (!buf) {
         atomic_fetch_sub_explicit(&session->replay_bytes_in_use, total,
                                   memory_order_relaxed);
@@ -1556,17 +1576,19 @@ nfs4_replay_capture_reply(
     /* Concatenate iovecs into a single contiguous buffer.  Loses
      * zerocopy on replay; acceptable since cachethis=true is rare for
      * iovec-heavy ops (READ/READLINK) and replay is rare in general. */
-    for (i = 0; i < niov; i++) {
-        memcpy(buf + offset, iov[i].data, iov[i].length);
-        offset += iov[i].length;
+    if (nfs_drc_copy_rpc_reply(iov, niov, rpc_offset, buf, rpc_len) != rpc_len) {
+        free(buf);
+        atomic_fetch_sub_explicit(&session->replay_bytes_in_use, total,
+                                  memory_order_relaxed);
+        return;
     }
 
     /* Same thread runs finalize next, which release-publishes these via the
      * state_word store -- a later reader that observes CACHED sees them. */
     slot->cached_buf = buf;
-    slot->cached_len = total_length;
+    slot->cached_len = rpc_len;
 
-    nfs4_replay_bytes_delta(req, total_length);
+    nfs4_replay_bytes_delta(req, rpc_len);
 } /* nfs4_replay_capture_reply */
 
 /*
@@ -1941,44 +1963,26 @@ nfs4_replay_slot_replay_done(struct nfs_request *req)
 } /* nfs4_replay_slot_replay_done */
 
 /*
- * Record the delegation callback path for a client onto its unified state
- * record.  Called from the SETCLIENTID handler (4.0, with a cb_client4) and
- * from CREATE_SESSION (4.1, program only -- the backchannel rides the fore
- * conn).  Re-setting the path (e.g. a fresh SETCLIENTID) resets the probe
- * state so the callback channel is re-validated before any new delegation.
+ * Commit callback addressing onto a client's unified state record.  Re-setting
+ * the path resets the probe state so the callback channel is re-validated
+ * before any new delegation.  The caller holds the client table lock.
  *
  * The actual outbound channel (cb_path.cb_client) is established lazily by
  * the callback subsystem; here we only capture the addressing the client
  * supplied.
  */
-void
-nfs4_client_set_cb_path(
-    struct nfs4_client_table *table,
-    uint64_t                  client_id,
-    uint32_t                  cb_program,
-    uint32_t                  cb_ident,
-    uint8_t                   minorversion,
-    const char               *netid,
-    int                       netid_len,
-    const char               *addr,
-    int                       addr_len)
+static void
+nfs4_cb_path_store(
+    struct nfs_client *u,
+    uint32_t           cb_program,
+    uint32_t           cb_ident,
+    uint8_t            minorversion,
+    const char        *netid,
+    int                netid_len,
+    const char        *addr,
+    int                addr_len)
 {
-    struct nfs4_client  *c;
-    struct nfs_client   *u;
-    struct nfs4_cb_path *cb;
-
-    pthread_mutex_lock(&table->nfs4_ct_lock);
-
-    HASH_FIND(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
-              &client_id, sizeof(client_id), c);
-
-    if (!c || !c->unified) {
-        pthread_mutex_unlock(&table->nfs4_ct_lock);
-        return;
-    }
-
-    u  = c->unified;
-    cb = &u->cb_path;
+    struct nfs4_cb_path *cb = &u->cb_path;
 
     if (addr_len >= (int) sizeof(cb->cb_addr)) {
         addr_len = sizeof(cb->cb_addr) - 1;
@@ -2025,8 +2029,128 @@ nfs4_client_set_cb_path(
     }
 
     pthread_mutex_unlock(&u->lock);
+} /* nfs4_cb_path_store */
+
+/*
+ * Apply a callback path immediately.  Used by CREATE_SESSION (4.1, program
+ * only -- the backchannel rides the fore conn), where the operation that
+ * carries the addressing is itself the one that confirms the client.  The 4.0
+ * SETCLIENTID path stages instead; see nfs4_client_stage_cb_path.
+ */
+void
+nfs4_client_set_cb_path(
+    struct nfs4_client_table *table,
+    uint64_t                  client_id,
+    uint32_t                  cb_program,
+    uint32_t                  cb_ident,
+    uint8_t                   minorversion,
+    const char               *netid,
+    int                       netid_len,
+    const char               *addr,
+    int                       addr_len)
+{
+    struct nfs4_client *c;
+
+    pthread_mutex_lock(&table->nfs4_ct_lock);
+
+    HASH_FIND(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
+              &client_id, sizeof(client_id), c);
+
+    if (c && c->unified) {
+        nfs4_cb_path_store(c->unified, cb_program, cb_ident, minorversion,
+                           netid, netid_len, addr, addr_len);
+    }
+
     pthread_mutex_unlock(&table->nfs4_ct_lock);
 } /* nfs4_client_set_cb_path */
+
+/*
+ * Stage the callback path a 4.0 SETCLIENTID supplied.
+ *
+ * RFC 7530 §16.33.5: a callback/callback_ident update "is only confirmed if
+ * followed up by a SETCLIENTID_CONFIRM", and §16.34.5 makes the confirm the
+ * step that modifies "recorded and confirmed callback and callback_ident
+ * information".  The RFC tolerates a stray SETCLIENTID carrying stale
+ * callback info precisely because of that deferral, so the addressing is
+ * parked on the client record here and only reaches the live unified record
+ * in nfs4_client_commit_cb_path.
+ */
+void
+nfs4_client_stage_cb_path(
+    struct nfs4_client_table *table,
+    uint64_t                  client_id,
+    uint32_t                  cb_program,
+    uint32_t                  cb_ident,
+    const char               *netid,
+    int                       netid_len,
+    const char               *addr,
+    int                       addr_len)
+{
+    struct nfs4_client *c;
+
+    pthread_mutex_lock(&table->nfs4_ct_lock);
+
+    HASH_FIND(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
+              &client_id, sizeof(client_id), c);
+
+    if (c) {
+        if (netid_len < 0) {
+            netid_len = 0;
+        }
+        if (netid_len > (int) sizeof(c->nfs4_client_scid_cb_netid)) {
+            netid_len = sizeof(c->nfs4_client_scid_cb_netid);
+        }
+        if (addr_len < 0) {
+            addr_len = 0;
+        }
+        if (addr_len > (int) sizeof(c->nfs4_client_scid_cb_addr)) {
+            addr_len = sizeof(c->nfs4_client_scid_cb_addr);
+        }
+
+        c->nfs4_client_scid_cb_program   = cb_program;
+        c->nfs4_client_scid_cb_ident     = cb_ident;
+        c->nfs4_client_scid_cb_netid_len = (uint32_t) netid_len;
+        c->nfs4_client_scid_cb_addr_len  = (uint32_t) addr_len;
+        if (netid_len) {
+            memcpy(c->nfs4_client_scid_cb_netid, netid, netid_len);
+        }
+        if (addr_len) {
+            memcpy(c->nfs4_client_scid_cb_addr, addr, addr_len);
+        }
+        c->nfs4_client_scid_cb_valid = 1;
+    }
+
+    pthread_mutex_unlock(&table->nfs4_ct_lock);
+} /* nfs4_client_stage_cb_path */
+
+void
+nfs4_client_commit_cb_path(
+    struct nfs4_client_table *table,
+    uint64_t                  client_id)
+{
+    struct nfs4_client *c;
+
+    pthread_mutex_lock(&table->nfs4_ct_lock);
+
+    HASH_FIND(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
+              &client_id, sizeof(client_id), c);
+
+    if (c && c->unified && c->nfs4_client_scid_cb_valid) {
+        /* One-shot: a retransmitted SETCLIENTID_CONFIRM must not tear the
+         * channel this one just authorised back down. */
+        c->nfs4_client_scid_cb_valid = 0;
+        nfs4_cb_path_store(c->unified,
+                           c->nfs4_client_scid_cb_program,
+                           c->nfs4_client_scid_cb_ident,
+                           0,
+                           c->nfs4_client_scid_cb_netid,
+                           (int) c->nfs4_client_scid_cb_netid_len,
+                           c->nfs4_client_scid_cb_addr,
+                           (int) c->nfs4_client_scid_cb_addr_len);
+    }
+
+    pthread_mutex_unlock(&table->nfs4_ct_lock);
+} /* nfs4_client_commit_cb_path */
 
 /*
  * Record the RPC auth flavor/credentials the client wants the server to use on

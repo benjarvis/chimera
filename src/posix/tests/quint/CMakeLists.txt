@@ -59,7 +59,7 @@ set_tests_properties(chimera/posix/smb/loopback_probe PROPERTIES
 # offered or fail to find one in common.  There is no readback to trust.
 foreach(vers 2.1 3.0 3.0.2 3.1.1)
     add_test(NAME chimera/posix/smb/loopback_probe_${vers}
-        COMMAND $<TARGET_FILE:smb_loopback_probe> ${vers})
+        COMMAND $<TARGET_FILE:smb_loopback_probe> --vers=${vers})
     set_tests_properties(chimera/posix/smb/loopback_probe_${vers} PROPERTIES
         ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb_loopback_probe_${vers}"
         LABELS "quint;posix_mbt;memfs;smb_mbt"
@@ -73,9 +73,165 @@ endforeach()
 # that was silently ignored would negotiate 3.1.1, mount happily, and fail this
 # test.  If 2.0.2 support is ever added, this test starts failing and says so.
 add_test(NAME chimera/posix/smb/loopback_dialect_refused_2.0.2
-    COMMAND $<TARGET_FILE:smb_loopback_probe> 2.0.2 expect-mount-failure)
+    COMMAND $<TARGET_FILE:smb_loopback_probe>
+            --vers=2.0.2 --expect-mount-failure)
 set_tests_properties(chimera/posix/smb/loopback_dialect_refused_2.0.2 PROPERTIES
     ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb_loopback_refused_2.0.2"
+    LABELS "quint;posix_mbt;memfs;smb_mbt"
+    TIMEOUT 300)
+
+# ---------------------------------------------------------------------------
+# Wire policy: what the client does when the SERVER demands something.
+#
+# These vary the server's configuration, not the client's capabilities, which
+# is what makes them interesting -- the smb client VFS module carries signing
+# but NO encryption and NO compression (there is no transform header, no
+# AEAD, and no codec anywhere in src/vfs/smb).  So each cell answers "what
+# happens when the far end insists", and the answer is only sometimes "it
+# works".
+#
+#   name                       server demands            expected
+#   sign_required              SIGNING_REQUIRED          mount + probe (3.x signs)
+#   encrypt_enabled            encryption = 1 (offer)    mount + probe: the
+#                                                        client offers no cipher
+#                                                        and mode 1 does not
+#                                                        insist, which is the
+#                                                        spec-correct degrade
+#   encrypt_required           encryption = 2 (require)  mount REFUSED
+#   compress_enabled           compression advertised    mount + probe: the
+#                                                        client never negotiates
+#                                                        it, so the share flag is
+#                                                        inert
+#   leases                     oplocks + leases granted  mount + probe
+foreach(cell "sign_required|--sign-required"
+             "encrypt_enabled|--encrypt"
+             "compress_enabled|--compress"
+             "leases|--leases"
+             "all_features|--sign-required --encrypt --compress --leases")
+    # Split name from flags on '|', then the flag STRING on spaces.  Putting
+    # ';' inside the cell would make the REPLACE above produce one flat list, so
+    # list(GET parts 1) would silently take only the FIRST flag -- which is
+    # exactly how three cells here came to test less than their names claimed.
+    string(REPLACE "|" ";" parts "${cell}")
+    list(GET parts 0 cname)
+    list(GET parts 1 cflagstr)
+    string(REPLACE " " ";" cflags "${cflagstr}")
+    add_test(NAME chimera/posix/smb/loopback_wire_${cname}
+        COMMAND $<TARGET_FILE:smb_loopback_probe> ${cflags})
+    set_tests_properties(chimera/posix/smb/loopback_wire_${cname} PROPERTIES
+        ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb_loopback_wire_${cname}"
+        LABELS "quint;posix_mbt;memfs;smb_mbt"
+        TIMEOUT 300)
+endforeach()
+
+# Sealed sessions: the whole POSIX probe replayed over SMB3 transport
+# encryption.  seal=yes makes the client offer a cipher, so these are the cells
+# where the client actually encrypts rather than merely tolerating a demand.
+#
+# The dialect split is load-bearing, not redundant: 3.0/3.0.2 negotiate no
+# encryption context and can only use AES-128-CCM with the "ServerIn "/
+# "ServerOut" KDF contexts, while 3.1.1 negotiates AES-128-GCM keyed by
+# SMBC2SCipherKey/SMBS2CCipherKey over the preauth hash.  Different cipher,
+# different mode, different key schedule -- covered here as 0x0001 and 0x0002
+# respectively.  A mistake in either would not corrupt data, it would fail every
+# AEAD tag check, so these tests either pass or the mount dies.
+foreach(vers 3.0 3.0.2 3.1.1)
+    add_test(NAME chimera/posix/smb/loopback_sealed_${vers}
+        COMMAND $<TARGET_FILE:smb_loopback_probe>
+                --seal --encrypt --vers=${vers})
+    set_tests_properties(chimera/posix/smb/loopback_sealed_${vers} PROPERTIES
+        ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb_loopback_sealed_${vers}"
+        LABELS "quint;posix_mbt;memfs;smb_mbt"
+        TIMEOUT 300)
+endforeach()
+
+# Sealed against a server that REQUIRES encryption -- the pairing the previous
+# commit's enforcement exists for: the demand is now satisfiable rather than
+# only refusable.
+add_test(NAME chimera/posix/smb/loopback_sealed_required
+    COMMAND $<TARGET_FILE:smb_loopback_probe> --seal --encrypt-required)
+set_tests_properties(chimera/posix/smb/loopback_sealed_required PROPERTIES
+    ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb_loopback_sealed_required"
+    LABELS "quint;posix_mbt;memfs;smb_mbt"
+    TIMEOUT 300)
+
+# seal= is a security request, so the two ways it cannot be met are refusals,
+# not silent downgrades to cleartext:
+#
+#   sealed_unsupported_by_server  the server has encryption off.  It still
+#                                 SELECTS a cipher for any 3.1.1 client that
+#                                 offers one, so a negotiated cipher is not
+#                                 evidence the peer expects ciphertext --
+#                                 encrypting anyway sends traffic it drops.
+#   sealed_2.1                    encryption does not exist below 3.0.
+#   signed_required_2.1           the server demands signing; the client
+#                                 deliberately never signs at 2.1, so there is
+#                                 no session to be had.  The server enforces by
+#                                 tearing the connection down rather than
+#                                 answering an error, so this is also the cell
+#                                 that covers a mount dying mid-handshake --
+#                                 the case that used to complete its request
+#                                 twice.
+foreach(cell "sealed_unsupported_by_server|--seal"
+             "sealed_2.1|--seal --encrypt --vers=2.1"
+             "signed_required_2.1|--sign-required --vers=2.1")
+    # Split name from flags on '|', then the flag STRING on spaces.  Putting
+    # ';' inside the cell would make the REPLACE above produce one flat list, so
+    # list(GET parts 1) would silently take only the FIRST flag -- which is
+    # exactly how three cells here came to test less than their names claimed.
+    string(REPLACE "|" ";" parts "${cell}")
+    list(GET parts 0 cname)
+    list(GET parts 1 cflagstr)
+    string(REPLACE " " ";" cflags "${cflagstr}")
+    add_test(NAME chimera/posix/smb/loopback_${cname}_refused
+        COMMAND $<TARGET_FILE:smb_loopback_probe> ${cflags}
+                --expect-mount-failure)
+    set_tests_properties(chimera/posix/smb/loopback_${cname}_refused PROPERTIES
+        ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb_loopback_${cname}"
+        LABELS "quint;posix_mbt;memfs;smb_mbt"
+        TIMEOUT 300)
+endforeach()
+
+# SMB3 transport compression.  The probe's compressible round trip (a 16 KiB
+# repeating pattern written, read back in one pread, compared byte for byte) is
+# what makes these cells mean anything: chimera compresses only a READ reply,
+# only when the client set SMB2_READFLAG_REQUEST_COMPRESSED, and only when the
+# payload actually shrinks -- so a suite whose largest read is three bytes would
+# negotiate compression and never execute a byte of the decoder.
+#
+# Measured on the wire: 464 bytes expanding to 12,368, and zero decompressions
+# in the client_silent cell below.  If that ever inverts, the cells are lying.
+foreach(cell "compressed|--client-compress --compress"
+             "compressed_sealed|--client-compress --compress --seal --encrypt"
+             "compressed_server_declines|--client-compress"
+             "compressed_client_silent|--compress")
+    # Split name from flags on '|', then the flag STRING on spaces.  Putting
+    # ';' inside the cell would make the REPLACE above produce one flat list, so
+    # list(GET parts 1) would silently take only the FIRST flag -- which is
+    # exactly how three cells here came to test less than their names claimed.
+    string(REPLACE "|" ";" parts "${cell}")
+    list(GET parts 0 cname)
+    list(GET parts 1 cflagstr)
+    string(REPLACE " " ";" cflags "${cflagstr}")
+    add_test(NAME chimera/posix/smb/loopback_${cname}
+        COMMAND $<TARGET_FILE:smb_loopback_probe> ${cflags})
+    set_tests_properties(chimera/posix/smb/loopback_${cname} PROPERTIES
+        ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb_loopback_${cname}"
+        LABELS "quint;posix_mbt;memfs;smb_mbt"
+        TIMEOUT 300)
+endforeach()
+
+# The one cell whose answer is a refusal.  smb_encryption=2 REQUIRES encryption;
+# this client negotiates none, so the session setup must be denied.  Before the
+# enforcement fix that ships with this test, the knob was read as a boolean
+# everywhere in the server and mode 2 behaved exactly like mode 1 -- the whole
+# session was served in cleartext while configured to require encryption.
+add_test(NAME chimera/posix/smb/loopback_wire_encrypt_required_refused
+    COMMAND $<TARGET_FILE:smb_loopback_probe>
+            --encrypt-required --expect-mount-failure)
+set_tests_properties(chimera/posix/smb/loopback_wire_encrypt_required_refused
+    PROPERTIES
+    ENVIRONMENT "CHIMERA_MBT_ARTIFACTS=smb_loopback_wire_encrypt_required"
     LABELS "quint;posix_mbt;memfs;smb_mbt"
     TIMEOUT 300)
 

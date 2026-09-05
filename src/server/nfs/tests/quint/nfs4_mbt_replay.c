@@ -76,6 +76,12 @@
  * ffl_stripe_unit (8) + ffl_mirrors<> count (4) + ffm_data_servers<> count (4). */
 #define V4_FF_DEVICEID_OFF  16
 
+/* Offset of the ffds_fh_vers<> element -- the data server handle that names the
+ * backing file -- in the same body: ffds_deviceid (16) + ffds_efficiency (4) +
+ * ffds_stateid (16) + ffds_fh_vers<> count (4) past V4_FF_DEVICEID_OFF.  Points
+ * at the opaque's length prefix; see chimera_nfs4_encode_ff_layout(). */
+#define V4_FF_DSFH_OFF      56
+
 #define E_DELAY             10008
 #define E_DENIED            10010
 #define E_NOTSUPP           10004
@@ -410,6 +416,7 @@ struct v4_res {
     }        segs[4];
     uint8_t         deviceid[16];
     int             has_deviceid;
+    struct mbt_fh   ds_fh;            /* flex-files backing file handle */
     int             lr_present;       /* LAYOUTRETURN */
     int             has_newsize;      /* LAYOUTCOMMIT */
     uint64_t        newsize;
@@ -440,6 +447,13 @@ struct v4_chg {
     int64_t  ino;
     int64_t  abstract;
     uint64_t wire;
+};
+
+/* Where a file's data lives: which data server (deviceid) and which file on
+ * it (the flex-files backing handle).  See oracle.layout_loc. */
+struct v4_layout_loc {
+    struct mbt_fh fh;
+    uint8_t       deviceid[16];
 };
 
 struct v4_hist {
@@ -487,6 +501,22 @@ struct oracle {
 
     uint8_t                deviceid[16];
     int                    has_deviceid;
+
+    /* ino -> the backing location its first LAYOUTGET named.  A metadata
+     * server that persists its per-file layout hands out the same one every
+     * time; one that loses it re-steers, and the round-robin lands the file on
+     * a different data server whose copy is empty -- silently orphaning
+     * everything written through the previous layout.  Nothing else in the
+     * corpus can tell those apart: both answer NFS4_OK with a well-formed
+     * layout covering the requested range, so the invariant is checked here
+     * rather than modeled.
+     *
+     * BOTH halves matter.  The data servers in the test cluster are freshly
+     * mkfs'd instances of one backend, and the backing file is named after the
+     * MDS fileid, so the same file re-created on a different DS gets an
+     * IDENTICAL native handle -- the deviceid is the only thing that says
+     * which server it lives on.  Comparing handles alone silently passes. */
+    struct v4_layout_loc   layout_loc[V4_MAX_INOS];
 
     /* Per-model-client connections (a model client
     * owns its own connection, like a real one). */
@@ -917,10 +947,20 @@ conn_for(
     }
     if (!o->conns[model_client]) {
         cb_programs[0] = &o->env->nfs_v4_cb.rpc2;
-        ep             = chimera_tcp_flavor_endpoint_create(CHIMERA_TCP_FLAVOR_INPROC,
-                                                            "127.0.0.1", 2049);
+        /* Follow the env's transport.  These per-model-client connections
+         * carry every stateful compound the trace issues -- conn_for() only
+         * falls back to env->nfs_conn for a compound with no client -- so
+         * leaving them on the stream endpoint would put most of an --rdma run
+         * back on plain RPC. */
+        ep = chimera_tcp_flavor_endpoint_create(CHIMERA_TCP_FLAVOR_INPROC,
+                                                "127.0.0.1",
+                                                o->env->rdma
+                                                ? MBT_NFS_RDMA_PORT
+                                                : 2049);
         o->conns[model_client] =
-            evpl_rpc2_client_connect(o->env->rpc2_thread, EVPL_STREAM_INPROC,
+            evpl_rpc2_client_connect(o->env->rpc2_thread,
+                                     o->env->rdma ? EVPL_DATAGRAM_INPROC
+                                     : EVPL_STREAM_INPROC,
                                      ep, cb_programs, 1, o);
         if (!o->conns[model_client]) {
             fprintf(stderr, "failed to open connection for model client "
@@ -2385,8 +2425,16 @@ decode_resop(
 
                 r->eof  = rop->opread.resok4.eof != 0;
                 r->data = o->arena + o->arena_used;
+                /* data.length, not the iovec lengths: an RDMA Write chunk
+                 * comes back at the size the client ADVERTISED, not the size
+                 * the server filled, so a short read hands back a longer
+                 * iovec whose tail is undefined.  chimera's own client reads
+                 * the same field (vfs/nfs/nfs4_read.c). */
                 for (i = 0; i < rop->opread.resok4.data.niov; i++) {
                     n = rop->opread.resok4.data.iov[i].length;
+                    if (off + n > rop->opread.resok4.data.length) {
+                        n = rop->opread.resok4.data.length - off;
+                    }
                     if (o->arena_used + off + n > V4_DATA_ARENA) {
                         n = V4_DATA_ARENA - o->arena_used - off;
                     }
@@ -2667,6 +2715,25 @@ decode_resop(
                     if (body->len >= off + 16) {
                         memcpy(r->deviceid, body->data + off, 16);
                         r->has_deviceid = 1;
+                    }
+
+                    /* The backing file handle, for the layout-stability check
+                     * in check_result().  Flex-files only: a block layout
+                     * names extents on a volume, not a file on a data
+                     * server. */
+                    if (g_layout_type == V4_LAYOUT_FLEX &&
+                        body->len >= V4_FF_DSFH_OFF + 4) {
+                        const uint8_t *q   = body->data + V4_FF_DSFH_OFF;
+                        uint32_t       len = ((uint32_t) q[0] << 24) |
+                            ((uint32_t) q[1] << 16) |
+                            ((uint32_t) q[2] << 8) | q[3];
+
+                        if (len <= sizeof(r->ds_fh.data) &&
+                            body->len >= V4_FF_DSFH_OFF + 4 + len) {
+                            memcpy(r->ds_fh.data, q + 4, len);
+                            r->ds_fh.len = len;
+                            r->ds_fh.has = 1;
+                        }
                     }
                 }
             }
@@ -3529,6 +3596,24 @@ check_result(
                 memcpy(o->deviceid, r->deviceid, 16);
                 o->has_deviceid = 1;
             }
+
+            /* Layout stability: the backing location of an ino is fixed for
+             * its lifetime.  See oracle.layout_loc. */
+            if (r->ds_fh.has && r->has_deviceid &&
+                ctx->cur >= 0 && ctx->cur < V4_MAX_INOS) {
+                struct v4_layout_loc *known = &o->layout_loc[ctx->cur];
+
+                if (!known->fh.has) {
+                    known->fh = r->ds_fh;
+                    memcpy(known->deviceid, r->deviceid, 16);
+                } else if (memcmp(known->deviceid, r->deviceid, 16) != 0 ||
+                           !mbt_fh_eq(&known->fh, &r->ds_fh)) {
+                    mism_add(m, "layoutget: backing location changed for ino "
+                             "%" PRId64 " -- the metadata server did not "
+                             "persist its layout and re-steered",
+                             (int64_t) ctx->cur);
+                }
+            }
         }
     } else if (strcmp(tag, "SLayoutreturn") == 0) {
         if (r->lr_present != jf_bool(v, "present")) {
@@ -3720,6 +3805,8 @@ run_compound(
     uint32_t             retry_slot = 0;
     int                  retry_sess = 0;
     int                  has_seq    = 0;
+    int                  cd_ddp     = 0;
+    int                  cd_wchunk  = 0;
 
     o->status_dev              = 0;
     o->cur_open_clientid_known = 0;
@@ -3750,6 +3837,25 @@ run_compound(
     {
         if (encode_op(o, op, &argarray[i], &scratch[i], m) < 0) {
             return -1;
+        }
+
+        /* RDMA chunk eligibility for this compound, mirroring what chimera's
+         * own v4 client asks for (vfs/nfs/nfs4_write.c, nfs4_read.c): a WRITE
+         * puts its payload in a Read chunk for the server to pull (ddp), and a
+         * READ advertises a Write chunk the server can place the reply data
+         * into.  Without these an RDMA run gets RPC-over-RDMA framing but never
+         * a one-sided transfer, and the server's chunk handling goes untested.
+         *
+         * Accumulated here, as each op is encoded, rather than in a second pass
+         * over argarray: only the ops this loop has written are initialized,
+         * and a later pass bounded by nops cannot show the analyzer that. */
+        if (o->env->rdma) {
+            if (argarray[i].argop == OP_WRITE) {
+                cd_ddp = 1;
+            } else if (argarray[i].argop == OP_READ &&
+                       (int) argarray[i].opread.count > cd_wchunk) {
+                cd_wchunk = (int) argarray[i].opread.count;
+            }
         }
     }
 
@@ -3828,7 +3934,8 @@ run_compound(
         o->env->nfs_v4.send_call_NFSPROC4_COMPOUND(&o->env->nfs_v4.rpc2,
                                                    o->env->evpl, conn,
                                                    &o->env->cred, &args,
-                                                   0, 0, NULL, 0, 0,
+                                                   cd_ddp, cd_wchunk,
+                                                   NULL, 0, 0,
                                                    v4_compound_cb, &cctx);
         while (!rep.done) {
             evpl_continue(o->env->evpl);
@@ -4648,6 +4755,7 @@ main(
         { "backend",        required_argument, 0, 'b' },
         { "pnfs",           required_argument, 0, 'p' },
         { "delegations",    no_argument,       0, 'g' },
+        { "rdma",           no_argument,       0, 'R' },
         { "dry-run",        no_argument,       0, 'n' },
         { "verbose",        no_argument,       0, 'v' },
         { 0,                0,                 0, 0   },
@@ -4687,7 +4795,7 @@ main(
      * shared helper; getopt only recognizes them so it does not error. */
     traces = mbt_collect_traces(argc, argv, &ntraces);
 
-    while ((c = getopt_long(argc, argv, "t:D:X:M:b:p:gnv", long_options,
+    while ((c = getopt_long(argc, argv, "t:D:X:M:b:p:gnvR", long_options,
                             NULL)) != -1) {
         switch (c) {
             case 't':
@@ -4727,11 +4835,14 @@ main(
                     return 2;
                 }
                 break;
+            case 'R':
+                opts.rdma = 1;
+                break;
             default:
                 fprintf(stderr,
                         "usage: %s [--trace FILE ...] [--trace-dir DIR] "
                         "[--backend memfs|diskfs|cairn|linux|io_uring] "
-                        "[--pnfs N] [--delegations] "
+                        "[--pnfs N] [--delegations] [--rdma] "
                         "[--mandatory CAP] [--dry-run] [--verbose]\n",
                         argv[0]);
                 mbt_free_traces(traces, ntraces);

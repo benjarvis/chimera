@@ -167,15 +167,16 @@ chimera_nfs4_attr2mask(
                         attr_mask |= CHIMERA_VFS_ATTR_FSID;
                         break;
                     case FATTR4_FILES_AVAIL:
-                        attr_mask |= CHIMERA_VFS_ATTR_SPACE_AVAIL;
+                        attr_mask |= CHIMERA_VFS_ATTR_FILES_AVAIL;
                         break;
                     case FATTR4_FILES_FREE:
-                        attr_mask |= CHIMERA_VFS_ATTR_SPACE_FREE;
+                        attr_mask |= CHIMERA_VFS_ATTR_FILES_FREE;
                         break;
                     case FATTR4_FILES_TOTAL:
-                        attr_mask |= CHIMERA_VFS_ATTR_SPACE_TOTAL;
+                        attr_mask |= CHIMERA_VFS_ATTR_FILES_TOTAL;
                         break;
                     case FATTR4_UNIQUE_HANDLES:
+                    case FATTR4_MOUNTED_ON_FILEID:
                         attr_mask |= CHIMERA_VFS_ATTR_INUM;
                         break;
                     case FATTR4_LEASE_TIME:
@@ -204,6 +205,11 @@ chimera_nfs4_attr2mask(
                         break;
                     case FATTR4_SPACE_USED:
                         attr_mask |= CHIMERA_VFS_ATTR_SPACE_USED;
+                        break;
+                    case FATTR4_TIME_CREATE:
+                        /* Birth time is optional in the VFS, so backends fill
+                         * it only when it is asked for by name. */
+                        attr_mask |= CHIMERA_VFS_ATTR_BTIME;
                         break;
                     default:
                         break;
@@ -241,8 +247,6 @@ chimera_nfs4_mask2attr(
     uint32_t                 *req_mask,
     uint32_t                 *rsp_mask)
 {
-    int max_word_used = 0;
-
     /*
      * num_req_mask is the client-supplied request bitmap length and is
      * unbounded (the XDR decoder does not cap it).  This routine only ever
@@ -259,32 +263,57 @@ chimera_nfs4_mask2attr(
     if (num_req_mask >= 2 &&
         (req_mask[1] & (1 << (FATTR4_MODE - 32))) &&
         (attr->va_set_mask & CHIMERA_VFS_ATTR_MODE)) {
-        rsp_mask[1]  |= (1 << (FATTR4_MODE - 32));
-        max_word_used = 2;
+        rsp_mask[1] |= (1 << (FATTR4_MODE - 32));
     }
 
     if (num_req_mask >= 1 &&
         (req_mask[0] & (1 << FATTR4_SIZE)) &&
         (attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE)) {
-        rsp_mask[0]  |= (1 << FATTR4_SIZE);
-        max_word_used = 1;
+        rsp_mask[0] |= (1 << FATTR4_SIZE);
+    }
+
+    if (num_req_mask >= 1 &&
+        (req_mask[0] & (1 << FATTR4_ACL)) &&
+        (attr->va_set_mask & CHIMERA_VFS_ATTR_ACL)) {
+        rsp_mask[0] |= (1 << FATTR4_ACL);
+    }
+
+    if (num_req_mask >= 2 &&
+        (req_mask[1] & (1 << (FATTR4_OWNER - 32))) &&
+        (attr->va_set_mask & CHIMERA_VFS_ATTR_UID)) {
+        rsp_mask[1] |= (1 << (FATTR4_OWNER - 32));
+    }
+
+    if (num_req_mask >= 2 &&
+        (req_mask[1] & (1 << (FATTR4_OWNER_GROUP - 32))) &&
+        (attr->va_set_mask & CHIMERA_VFS_ATTR_GID)) {
+        rsp_mask[1] |= (1 << (FATTR4_OWNER_GROUP - 32));
     }
 
     if (num_req_mask >= 2 &&
         (req_mask[1] & (1 << (FATTR4_TIME_ACCESS_SET - 32))) &&
         (attr->va_set_mask & CHIMERA_VFS_ATTR_ATIME)) {
-        rsp_mask[1]  |= (1 << (FATTR4_TIME_ACCESS_SET - 32));
-        max_word_used = 2;
+        rsp_mask[1] |= (1 << (FATTR4_TIME_ACCESS_SET - 32));
     }
 
     if (num_req_mask >= 2 &&
         (req_mask[1] & (1 << (FATTR4_TIME_MODIFY_SET - 32))) &&
         (attr->va_set_mask & CHIMERA_VFS_ATTR_MTIME)) {
-        rsp_mask[1]  |= (1 << (FATTR4_TIME_MODIFY_SET - 32));
-        max_word_used = 2;
+        rsp_mask[1] |= (1 << (FATTR4_TIME_MODIFY_SET - 32));
     }
 
-    return max_word_used;
+    /*
+     * Derive the reply bitmap length from the words actually set rather than
+     * tracking it as each block runs: a per-block assignment is order
+     * dependent, and a word-0 attribute reported after a word-1 one (SIZE after
+     * MODE, say) would shorten the bitmap back to one word and drop the word-1
+     * attributes the client just set.
+     */
+    if (rsp_mask[1]) {
+        return 2;
+    }
+
+    return rsp_mask[0] ? 1 : 0;
 } /* chimera_nfs4_mask2attr */
 
 static inline void
@@ -482,9 +511,11 @@ chimera_nfs4_marshall_attrs(
                                             (1UL << (FATTR4_SPACE_USED - 32)) |
                                             (1UL << (FATTR4_TIME_ACCESS - 32)) |
                                             (1UL << (FATTR4_TIME_ACCESS_SET - 32)) |
+                                            (1UL << (FATTR4_TIME_CREATE - 32)) |
                                             (1UL << (FATTR4_TIME_MODIFY - 32)) |
                                             (1UL << (FATTR4_TIME_MODIFY_SET - 32)) |
                                             (1UL << (FATTR4_TIME_METADATA - 32)) |
+                                            (1UL << (FATTR4_MOUNTED_ON_FILEID - 32)) |
                                             (1UL << (FATTR4_SPACE_AVAIL - 32)) |
                                             (1UL << (FATTR4_SPACE_FREE - 32)) |
                                             (1UL << (FATTR4_SPACE_TOTAL - 32)) |
@@ -735,7 +766,7 @@ chimera_nfs4_marshall_attrs(
         }
 
         if (req_mask[0] & (1 << FATTR4_FILES_AVAIL) &&
-            (attr->va_set_mask & CHIMERA_VFS_ATTR_FILES_FREE)) {
+            (attr->va_set_mask & CHIMERA_VFS_ATTR_FILES_AVAIL)) {
             rsp_mask[0]  |= (1 << FATTR4_FILES_AVAIL);
             *num_rsp_mask = 1;
 
@@ -867,6 +898,20 @@ chimera_nfs4_marshall_attrs(
             chimera_nfs4_attr_append_uint32(&attrs, attr->va_atime.tv_nsec);
         }
 
+        /* time_create (RFC 7530 §5.7) is emitted between time_access (47) and
+         * time_metadata (52) to keep the attribute values in ascending bitmap
+         * order.  Only backends that track a real birth time set BTIME, so a
+         * backend without one simply leaves the bit out of the response
+         * bitmap, as for any other attribute it cannot supply. */
+        if ((req_mask[1] & (1 << (FATTR4_TIME_CREATE - 32))) &&
+            (attr->va_set_mask & CHIMERA_VFS_ATTR_BTIME)) {
+            rsp_mask[1]  |= (1 << (FATTR4_TIME_CREATE - 32));
+            *num_rsp_mask = 2;
+
+            chimera_nfs4_attr_append_uint64(&attrs, attr->va_btime.tv_sec);
+            chimera_nfs4_attr_append_uint32(&attrs, attr->va_btime.tv_nsec);
+        }
+
         if ((req_mask[1] & (1 << (FATTR4_TIME_METADATA - 32))) &&
             (attr->va_set_mask & CHIMERA_VFS_ATTR_CTIME)) {
             rsp_mask[1]  |= (1 << (FATTR4_TIME_METADATA - 32));
@@ -883,6 +928,22 @@ chimera_nfs4_marshall_attrs(
 
             chimera_nfs4_attr_append_uint64(&attrs, attr->va_mtime.tv_sec);
             chimera_nfs4_attr_append_uint32(&attrs, attr->va_mtime.tv_nsec);
+        }
+
+        /* mounted_on_fileid (RFC 7530 5.8.2) is the fileid the parent
+        * directory's READDIR reports for this object.  Chimera grafts each
+        * export directly into the pseudo-fs root, and nfs4_root_readdir
+        * reports the export root's own fileid for that entry -- there is no
+        * separate junction inode -- so the mounted-on fileid IS the object's
+        * fileid at every boundary, and trivially so away from one.  Clients
+        * (notably Linux, which requests this on every crossing) need it to
+        * fill in d_ino for a mount point without a second GETATTR. */
+        if ((req_mask[1] & (1 << (FATTR4_MOUNTED_ON_FILEID - 32))) &&
+            (attr->va_set_mask & CHIMERA_VFS_ATTR_INUM)) {
+            rsp_mask[1]  |= (1 << (FATTR4_MOUNTED_ON_FILEID - 32));
+            *num_rsp_mask = 2;
+
+            chimera_nfs4_attr_append_uint64(&attrs, attr->va_ino);
         }
 
         /* fs_layout_types is server-static (no backing VFS attribute); emit it
@@ -1295,7 +1356,8 @@ chimera_nfs4_validate_createattrs(
         (1 << (FATTR4_TIME_ACCESS_SET - 32)) |
         (1 << (FATTR4_TIME_METADATA - 32)) |
         (1 << (FATTR4_TIME_MODIFY - 32)) |
-        (1 << (FATTR4_TIME_MODIFY_SET - 32));
+        (1 << (FATTR4_TIME_MODIFY_SET - 32)) |
+        (1 << (FATTR4_MOUNTED_ON_FILEID - 32));
 
     static const uint32_t writable_word0 =
         (1 << FATTR4_SIZE) |

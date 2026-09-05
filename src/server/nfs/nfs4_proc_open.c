@@ -16,6 +16,7 @@
 #include "vfs/vfs_claim.h"
 #include "vfs/sdk/vfs_access.h"
 #include "vfs/sdk/vfs_acl.h"
+#include "vfs/vfs_idmap.h"
 
 /*
  * Acquire a cross-protocol SHARE reservation in the claim core for a freshly
@@ -110,6 +111,52 @@ chimera_nfs4_open_acquire_share(
 } /* chimera_nfs4_open_acquire_share */
 
 /*
+ * Report a declined delegation.  RFC 8881 §18.16: a server that supports the
+ * OPEN4_SHARE_ACCESS_WANT_* flags (chimera advertises WANT_ANY_DELEG and
+ * WANT_NO_DELEG in supported_attrs' open_arguments) MUST answer an OPEN that
+ * carried one of them with OPEN_DELEGATE_NONE_EXT and a reason, so the client
+ * can tell contention from resource exhaustion.  A 4.0 client, or a 4.1 client
+ * that expressed no preference, keeps the bare OPEN_DELEGATE_NONE.
+ *
+ * Always returns false, so decline sites can `return
+ * chimera_nfs4_open_deleg_none(...)` in place of a bare `return false`.
+ */
+static bool
+chimera_nfs4_open_deleg_none(
+    struct nfs_request *req,
+    struct OPEN4res    *res,
+    uint32_t            why)
+{
+    struct OPEN4args *args = &req->args_compound->argarray[req->index].opopen;
+    uint32_t          want = args->share_access & OPEN4_SHARE_ACCESS_WANT_DELEG_MASK;
+
+    res->resok4.delegation.delegation_type = OPEN_DELEGATE_NONE;
+
+    if (req->minorversion < 1 || want == OPEN4_SHARE_ACCESS_WANT_NO_PREFERENCE) {
+        return false;
+    }
+
+    /* A want that only asked to cancel an outstanding registration is not a
+     * failure to delegate; report it as such. */
+    if (want == OPEN4_SHARE_ACCESS_WANT_CANCEL) {
+        why = WND4_CANCELLED;
+    }
+
+    res->resok4.delegation.delegation_type    = OPEN_DELEGATE_NONE_EXT;
+    res->resok4.delegation.od_whynone.ond_why = why;
+
+    /* The union arm is selected by ond_why; chimera never registers a want, so
+     * it promises neither a push nor a signal. */
+    if (why == WND4_CONTENTION) {
+        res->resok4.delegation.od_whynone.ond_server_will_push_deleg = 0;
+    } else if (why == WND4_RESOURCE) {
+        res->resok4.delegation.od_whynone.ond_server_will_signal_avail = 0;
+    }
+
+    return false;
+} /* chimera_nfs4_open_deleg_none */
+
+/*
  * Decide whether to grant an OPEN delegation and, if so, mint it and populate
  * the OPEN response.  A read open is offered an OPEN_DELEGATE_READ; an open
  * that requests write access is offered an OPEN_DELEGATE_WRITE.  A delegation
@@ -120,7 +167,8 @@ chimera_nfs4_open_acquire_share(
  *   - no conflicting access is present on the file (a write delegation also
  *     requires no other reader/writer; conflicts are surfaced by the CACHING
  *     lease conflict matrix).
- * Otherwise the response carries OPEN_DELEGATE_NONE.  Must be called on the
+ * Otherwise the response carries a decline built by
+ * chimera_nfs4_open_deleg_none().  Must be called on the
  * client's connection thread (it may kick a CB_NULL probe).
  *
  * Returns true when the OPEN's response has been parked on the cb_path's
@@ -150,31 +198,32 @@ chimera_nfs4_open_grant_delegation(
     uint64_t                          fh_hash;
     bool                              exists = false;
     uint8_t                           deleg_type;
+    uint32_t                          want;
     struct nfsace4                   *perms;
-    static const char                 everyone[] = "EVERYONE@";
+    struct chimera_principal          who;
+    char                             *who_str;
+    int                               who_len;
 
     res->resok4.delegation.delegation_type = OPEN_DELEGATE_NONE;
 
     if (!chimera_server_config_get_nfs4_delegations(thread->shared->config)) {
-        return false;
+        return chimera_nfs4_open_deleg_none(req, res, WND4_RESOURCE);
     }
     if (!client) {
-        return false;
+        return chimera_nfs4_open_deleg_none(req, res, WND4_RESOURCE);
     }
     if (args->claim.claim != CLAIM_NULL && args->claim.claim != CLAIM_FH) {
-        return false;
+        return chimera_nfs4_open_deleg_none(req, res, WND4_RESOURCE);
     }
 
-    /* RFC 8881 §18.16: honor an explicit "no delegation wanted" request.  On
-    * 4.1+ this is reported as OPEN_DELEGATE_NONE_EXT with WND4_NOT_WANTED;
-    * 4.0 has no such extension, so the default OPEN_DELEGATE_NONE stands. */
-    if (args->share_access & OPEN4_SHARE_ACCESS_WANT_NO_DELEG) {
-        if (req->minorversion >= 1) {
-            res->resok4.delegation.delegation_type                       = OPEN_DELEGATE_NONE_EXT;
-            res->resok4.delegation.od_whynone.ond_why                    = WND4_NOT_WANTED;
-            res->resok4.delegation.od_whynone.ond_server_will_push_deleg = 0;
-        }
-        return false;
+    /* RFC 8881 §18.16: honor an explicit "no delegation wanted" request.  The
+     * WANT_ values are a field in share_access, not independent bits, so they
+     * have to be compared under the mask; WANT_CANCEL also means "no
+     * delegation" (and reports WND4_CANCELLED instead). */
+    want = args->share_access & OPEN4_SHARE_ACCESS_WANT_DELEG_MASK;
+    if (want == OPEN4_SHARE_ACCESS_WANT_NO_DELEG ||
+        want == OPEN4_SHARE_ACCESS_WANT_CANCEL) {
+        return chimera_nfs4_open_deleg_none(req, res, WND4_NOT_WANTED);
     }
 
     /* A write open earns a write delegation; otherwise a pure-read open earns
@@ -184,7 +233,7 @@ chimera_nfs4_open_grant_delegation(
     } else if (args->share_access & OPEN4_SHARE_ACCESS_READ) {
         deleg_type = OPEN_DELEGATE_READ;
     } else {
-        return false;
+        return chimera_nfs4_open_deleg_none(req, res, WND4_RESOURCE);
     }
 
     /* Tri-state probe gate.  PATH_UP grants below; NO_PATH is the historical
@@ -200,11 +249,26 @@ chimera_nfs4_open_grant_delegation(
         case NFS4_CB_GRANT_PATH_UP:
             break;
         case NFS4_CB_GRANT_NO_PATH:
-            return false;
+            return chimera_nfs4_open_deleg_none(req, res, WND4_RESOURCE);
         case NFS4_CB_GRANT_DEFER:
             nfs4_cb_probe_park(client, req);
             return true;
     } /* switch */
+
+    /* RFC 7530 §9.1.11: "The server must not bestow a delegation for any open
+     * that would require confirmation", and §16.18.5: "Servers MUST NOT
+     * require confirmation on OPENs that grant delegations."  The two
+     * decisions are made in different places -- install_state has already
+     * committed OPEN4_RESULT_CONFIRM into the reply for a 4.0 OPEN on an
+     * unconfirmed open_owner -- so read that decision back and decline rather
+     * than hand out a delegation stateid on open state that is still subject
+     * to cancellation if OPEN_CONFIRM never arrives.  The client gets one on
+     * its next OPEN.  Deliberately after the probe gate above so the first
+     * OPEN of a new owner still kicks the CB_NULL probe, leaving the path
+     * validated by the time that next OPEN arrives. */
+    if (res->resok4.rflags & OPEN4_RESULT_CONFIRM) {
+        return false;
+    }
 
     /* fh_hash must match the open-cache / SHARE-lease hashing so the
      * delegation and conflicting opens land on the same file_state. */
@@ -221,7 +285,7 @@ chimera_nfs4_open_grant_delegation(
     }
     pthread_mutex_unlock(&client->lock);
     if (exists) {
-        return false;
+        return chimera_nfs4_open_deleg_none(req, res, WND4_RESOURCE);
     }
 
     deleg = nfs_delegation_create(client, deleg_type,
@@ -252,7 +316,7 @@ chimera_nfs4_open_grant_delegation(
     if (!file_state) {
         nfs_delegation_destroy(deleg, &thread->shared->nfs4_state_table,
                                thread->vfs_thread);
-        return false;
+        return chimera_nfs4_open_deleg_none(req, res, WND4_RESOURCE);
     }
     deleg->file_state = file_state;
 
@@ -264,7 +328,7 @@ chimera_nfs4_open_grant_delegation(
         deleg->file_state = NULL;
         nfs_delegation_destroy(deleg, &thread->shared->nfs4_state_table,
                                thread->vfs_thread);
-        return false;
+        return chimera_nfs4_open_deleg_none(req, res, WND4_CONTENTION);
     }
     deleg->lease_held = true;
 
@@ -299,11 +363,35 @@ chimera_nfs4_open_grant_delegation(
         perms                               = &res->resok4.delegation.read.permissions;
     }
 
+    /* RFC 7530 §16.16: the permissions ACE names the users that may open the
+     * delegated file without an ACCESS call.  It therefore has to name the
+     * principal this delegation was handed to and carry the rights the
+     * delegation actually conveys: an EVERYONE@ ACE invites the client to skip
+     * the server's per-user check for every other local user, and READ_DATA on
+     * a write delegation sends the holder back for an ACCESS round trip to
+     * write -- the very round trip the field exists to eliminate.  The who
+     * string is rendered like FATTR4_OWNER (numeric form, no domain) and lives
+     * in the reply's dbuf so it outlives this frame. */
+    who     = chimera_idmap_uid_principal(req->cred.uid);
+    who_str = xdr_dbuf_alloc_space(CHIMERA_IDMAP_WHO_MAX,
+                                   req->encoding->dbuf);
+    chimera_nfs_abort_if(who_str == NULL, "Failed to allocate space");
+    who_len = chimera_idmap_principal_to_who(&who, NULL, who_str,
+                                             CHIMERA_IDMAP_WHO_MAX);
+
     perms->type        = ACE4_ACCESS_ALLOWED_ACE_TYPE;
     perms->flag        = 0;
-    perms->access_mask = ACE4_READ_DATA;
-    perms->who.len     = sizeof(everyone) - 1;
-    perms->who.data    = (void *) everyone;
+    perms->access_mask = ACE4_GENERIC_READ;
+
+    if (deleg_type == OPEN_DELEGATE_WRITE) {
+        /* The data/attribute rights a write delegation conveys; not WRITE_ACL
+         * or WRITE_OWNER, which it does not. */
+        perms->access_mask |= ACE4_WRITE_DATA | ACE4_APPEND_DATA |
+            ACE4_WRITE_ATTRIBUTES;
+    }
+
+    perms->who.len  = who_len > 0 ? who_len : 0;
+    perms->who.data = who_str;
     return false;
 } /* chimera_nfs4_open_grant_delegation */
 
@@ -545,6 +633,12 @@ chimera_nfs4_open_finish(
         owner->seqid = args->seqid;
         nfs4_replay_record(&owner->replay, args->seqid, OP_OPEN, status,
                            status == NFS4_OK ? &res->resok4.stateid : NULL);
+        /* RFC 7530 §9.1.7 wants the stored last response replayed verbatim.
+         * rflags carries OPEN4_RESULT_CONFIRM (§16.18.5), which a client may
+         * act on, so keep it alongside the stateid. */
+        if (status == NFS4_OK) {
+            owner->replay.rflags = res->resok4.rflags;
+        }
         pthread_mutex_unlock(&owner->lock);
     }
 
@@ -1104,6 +1198,44 @@ chimera_nfs4_open_claim_fh_complete(
     chimera_nfs4_open_complete(req, NFS4_OK);
 } /* chimera_nfs4_open_claim_fh_complete */
 
+/*
+ * Validate the delegate_stateid an OPEN with CLAIM_DELEGATE_CUR cites (RFC
+ * 7530 §16.16 / §10.4.3).  The claim asserts the caller already holds a
+ * delegation on the file, so the stateid has to resolve to a live delegation
+ * of this very client; a stateid that designates no such state is
+ * NFS4ERR_BAD_STATEID (or STALE_STATEID/EXPIRED, as the table decides) rather
+ * than something to quietly serve as an ordinary open.
+ */
+static nfsstat4
+chimera_nfs4_open_check_delegate_cur(struct nfs_request *req)
+{
+    struct chimera_server_nfs_thread *thread = req->thread;
+    struct OPEN4args                 *args   = &req->args_compound->argarray[req->index].opopen;
+    struct nfs_state_table           *table  = &thread->shared->nfs4_state_table;
+    void                             *state_void;
+    uint8_t                           state_type;
+    nfsstat4                          status;
+
+    status = nfs_state_table_acquire(table,
+                                     &args->claim.delegate_cur_info.delegate_stateid,
+                                     NFS4_SLOT_TYPE_DELEG,
+                                     &state_void,
+                                     &state_type);
+
+    if (status != NFS4_OK) {
+        return status;
+    }
+
+    status = nfs_state_check_client(
+        state_void, state_type,
+        req->session ? req->session->client_unified : NULL);
+
+    nfs_state_table_release(table, state_void, state_type,
+                            thread->vfs_thread);
+
+    return status;
+} /* chimera_nfs4_open_check_delegate_cur */
+
 static void
 chimera_nfs4_open_parent_complete(
     enum chimera_vfs_error          error_code,
@@ -1337,8 +1469,8 @@ chimera_nfs4_open_parent_complete(
             /* RFC 7530 §16.16: open of a file the client already holds a
              * delegation on, identified by name within the current FH's
              * directory.  Treat like CLAIM_NULL using the name carried in
-             * delegate_cur_info; the delegation the client cites is its own,
-             * so no recall is needed. */
+             * delegate_cur_info; the delegation the client cites must be its
+             * own -- verified below -- so no recall is needed. */
             status = chimera_nfs4_validate_name(&args->claim.delegate_cur_info.file);
             if (status != NFS4_OK) {
                 struct OPEN4res *res = &req->res_compound.resarray[req->index].opopen;
@@ -1347,6 +1479,16 @@ chimera_nfs4_open_parent_complete(
                 chimera_nfs4_open_complete(req, status);
                 return;
             }
+
+            status = chimera_nfs4_open_check_delegate_cur(req);
+            if (status != NFS4_OK) {
+                struct OPEN4res *res = &req->res_compound.resarray[req->index].opopen;
+                chimera_vfs_release(req->thread->vfs_thread, parent_handle);
+                res->status = status;
+                chimera_nfs4_open_complete(req, status);
+                return;
+            }
+
             if (args->openhow.opentype == OPEN4_NOCREATE) {
                 struct nfs4_open_lookup_regular_ctx *ctx;
 
@@ -1507,23 +1649,26 @@ chimera_nfs4_open(
                                                                args->seqid);
 
         if (cls == NFS4_SEQID_REPLAY) {
-            /* Return the cached reply.  Simplified replay (status +
-             * stateid only); cinfo/attrset/rflags/delegation are
-             * reconstructed as zero/none.  Linux clients tolerate this
-             * since they re-fetch attrs via GETATTR after OPEN.
+            /* Return the cached reply.  Simplified replay (status, stateid
+             * and rflags); cinfo/attrset/delegation are reconstructed as
+             * zero/none.  Linux clients tolerate that since they re-fetch
+             * attrs via GETATTR after OPEN.
+             *
+             * rflags is replayed rather than zeroed: RFC 7530 §9.1.7 requires
+             * the stored last response, and dropping OPEN4_RESULT_CONFIRM
+             * (§16.18.5) tells a retransmitting client the opposite of what
+             * the original reply said about its OPEN_CONFIRM obligation.
              *
              * A retransmit on the SAME connection is normally answered
              * byte-exact by the v4.0 reply cache before the compound is
              * even decoded (nfs4_v40_drc.c), so this branch is reached
-             * only when the retransmit arrives on a new connection --
-             * where losing rflags matters least, since a reconnecting
-             * client re-establishes its state anyway. */
+             * only when the retransmit arrives on a new connection. */
             res->status                            = owner->replay.status;
             res->resok4.stateid                    = owner->replay.stateid;
             res->resok4.cinfo.atomic               = 0;
             res->resok4.cinfo.before               = 0;
             res->resok4.cinfo.after                = 0;
-            res->resok4.rflags                     = 0;
+            res->resok4.rflags                     = owner->replay.rflags;
             res->resok4.num_attrset                = 0;
             res->resok4.delegation.delegation_type = OPEN_DELEGATE_NONE;
             pthread_mutex_unlock(&owner->lock);
@@ -1561,7 +1706,10 @@ chimera_nfs4_open(
      *   2. Per-client reclaim completion (RFC 8881 §18.51.3): once a 4.1+
      *      client establishes a new client ID it MUST send RECLAIM_COMPLETE
      *      before performing any non-reclaim locking operation.  Until it does,
-     *      a non-reclaim OPEN is refused with NFS4ERR_GRACE.  This is a
+     *      a non-reclaim OPEN is refused with NFS4ERR_GRACE.  Symmetrically,
+     *      once it has sent RECLAIM_COMPLETE the client may no longer reclaim:
+     *      a further CLAIM_PREVIOUS is NFS4ERR_NO_GRACE even while the
+     *      server-wide window is still open for other clients.  This is a
      *      per-client obligation independent of the server-wide grace window,
      *      so it is enforced whether or not in_grace is set. */
     {
@@ -1577,12 +1725,22 @@ chimera_nfs4_open(
             return;
         }
 
-        if (req->minorversion > 0 && !is_reclaim && req->session &&
-            !nfs4_client_reclaim_complete(&thread->shared->nfs4_shared_clients,
-                                          req->session->nfs4_session_clientid)) {
-            res->status = NFS4ERR_GRACE;
-            chimera_nfs4_open_complete(req, res->status);
-            return;
+        if (req->minorversion > 0 && req->session) {
+            bool done = nfs4_client_reclaim_complete(
+                &thread->shared->nfs4_shared_clients,
+                req->session->nfs4_session_clientid);
+
+            if (is_reclaim && done) {
+                res->status = NFS4ERR_NO_GRACE;
+                chimera_nfs4_open_complete(req, res->status);
+                return;
+            }
+
+            if (!is_reclaim && !done) {
+                res->status = NFS4ERR_GRACE;
+                chimera_nfs4_open_complete(req, res->status);
+                return;
+            }
         }
     }
 

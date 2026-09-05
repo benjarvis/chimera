@@ -140,6 +140,10 @@ struct nfs4_replay_cache {
     uint32_t        op;        /* nfs_opnum4 of the cached op  */
     nfsstat4        status;
     struct stateid4 stateid;   /* for OPEN/CLOSE/LOCK/LOCKU/etc. responses */
+    /* OPEN4_RESULT_* of a cached OPEN reply.  OPEN4_RESULT_CONFIRM is the one
+     * bit a client may act on, so replaying it verbatim matters; zeroed by
+     * nfs4_replay_record and filled in by the OPEN completion path. */
+    uint32_t        rflags;
     uint8_t         valid;
 };
 
@@ -191,6 +195,7 @@ nfs4_replay_record(
     replay->seqid  = seqid;
     replay->op     = op;
     replay->status = status;
+    replay->rflags = 0;
     if (stateid) {
         replay->stateid = *stateid;
     } else {
@@ -506,6 +511,12 @@ struct nfs_layout_state {
     uint16_t                 export_id; /* to re-wrap fh for CB_LAYOUTRECALL */
     uint32_t                 seqid;     /* server-incremented layout stateid seqid */
     uint32_t                 iomode;    /* current LAYOUTIOMODE4 */
+
+    /* layouttype4 granted for this file (RFC 8881 3.3.13): flex-files, block
+     * or SCSI.  CB_LAYOUTRECALL must echo it -- the client matches a recall by
+     * {layout type, fh, iomode, range} and answers NFS4ERR_NOMATCHING_LAYOUT
+     * otherwise.  Set by LAYOUTGET; 0 means "not yet granted". */
+    uint32_t                 layout_type;
 
     uint8_t                  shard;
     uint32_t                 slot_idx;
@@ -1126,6 +1137,13 @@ nfs_layout_state_bump(
 SYMBOL_EXPORT void
 nfs_layout_state_destroy(
     struct nfs_layout_state   *state,
+    struct nfs_state_table    *table,
+    struct chimera_vfs_thread *vfs_thread);
+
+/* Tear down every layout_state a client holds (LAYOUTRETURN4_ALL). */
+SYMBOL_EXPORT void
+nfs_layout_state_destroy_all(
+    struct nfs_client         *client,
     struct nfs_state_table    *table,
     struct chimera_vfs_thread *vfs_thread);
 
