@@ -870,6 +870,7 @@ main(
         { "no-nfs3-drc",    no_argument,       0, 'N' },
         { "backend",        required_argument, 0, 'B' },
         { "rdma",           no_argument,       0, 'R' },
+        { "sec",            required_argument, 0, 'S' },
         { 0,                0,                 0, 0   },
     };
     /* *INDENT-ON* */
@@ -884,12 +885,13 @@ main(
     int                 c, i;
     struct mbt_env      env;
     struct mbt_env_opts opts;
+    int                 sec_flavor = MBT_SEC_SYS;
 
     umask(0);
 
     traces = mbt_collect_traces(argc, argv, &ntraces);
 
-    while ((c = getopt_long(argc, argv, "t:D:X:nvpNB:R", long_options,
+    while ((c = getopt_long(argc, argv, "t:D:X:nvpNB:RS:", long_options,
                             NULL)) != -1) {
         switch (c) {
             case 't':
@@ -914,6 +916,18 @@ main(
             case 'R':
                 rdma = 1;
                 break;
+            case 'S': {
+                int sec = mbt_sec_parse(optarg);
+
+                if (sec < 0) {
+                    fprintf(stderr, "%s: unknown security flavor '%s'\n",
+                            argv[0], optarg);
+                    return 2;
+                }
+
+                sec_flavor = sec;
+                break;
+            }
             default:
                 fprintf(stderr,
                         "usage: %s [--trace FILE ...] [--trace-dir DIR] "
@@ -936,6 +950,7 @@ main(
         memset(&opts, 0, sizeof(opts));
         opts.module = backend;
         opts.rdma   = rdma;
+        opts.sec    = sec_flavor;
         /* The corpus generated from the nfsdrcNoV3 profile is replayed with the
          * NFSv3 cache off, which is the server's own default; everything else
          * needs it on.  The NFSv4.0 cache has no switch. */

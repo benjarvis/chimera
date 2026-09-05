@@ -739,9 +739,9 @@ op_mnt_export(
     json_t        *op,
     struct mism   *m)
 {
-    json_t                *reply = op_field(op, "reply");
-    struct mbt_aux_result *r     = mbt_mount_export(o->env);
-    json_t                *want;
+    json_t *reply = op_field(op, "reply");
+    struct mbt_aux_result *r = mbt_mount_export(o->env);
+    json_t *want;
     size_t                 n, i;
 
     if (!check_gate(o, reply, m)) {
@@ -814,9 +814,10 @@ check_asyncs(
     json_t        *op,
     struct mism   *m)
 {
-    struct mbt_aux *a      = mbt_aux(o->env);
-    json_t         *asyncs = itf_seq(op_field(op, "asyncs"));
-    size_t          want   = asyncs ? json_array_size(asyncs) : 0;
+    struct mbt_aux *a = mbt_aux(o->env);
+
+    json_t *asyncs = itf_seq(op_field(op, "asyncs"));
+    size_t          want = asyncs ? json_array_size(asyncs) : 0;
     int             taken[MBT_AUX_MAX_ASYNC];
     size_t          i;
     int             j;
@@ -842,7 +843,7 @@ check_asyncs(
 
     memset(taken, 0, sizeof(taken));
     for (i = 0; i < want; i++) {
-        json_t  *e     = json_array_get(asyncs, i);
+        json_t *e = json_array_get(asyncs, i);
         int      proc  = (int) itf_i64(json_object_get(e, "proc"));
         uint32_t stat  = (uint32_t) itf_i64(json_object_get(e, "stat"));
         int      found = 0;
@@ -898,11 +899,11 @@ op_nlm_test(
     json_t        *op,
     struct mism   *m)
 {
-    json_t                *reply = op_field(op, "reply");
-    int                    msg   = op_bool(op, "msg");
+    json_t *reply = op_field(op, "reply");
+    int                    msg = op_bool(op, "msg");
     struct aux_lock        l;
     struct mbt_aux_result *r;
-    json_t                *v, *holders;
+    json_t *v, *holders;
     uint32_t               want_stat;
     size_t                 n, i;
     int                    matched;
@@ -940,7 +941,7 @@ op_nlm_test(
     n       = holders ? json_array_size(holders) : 0;
     matched = 0;
     for (i = 0; i < n; i++) {
-        json_t  *h    = json_array_get(holders, i);
+        json_t *h = json_array_get(holders, i);
         uint64_t off  = (uint64_t) op_i64(h, "offset");
         uint64_t len  = holder_len(op_i64(h, "wireLen"));
         int      excl = op_bool(h, "excl");
@@ -968,7 +969,7 @@ op_nlm_lock(
     json_t        *op,
     struct mism   *m)
 {
-    json_t         *reply = op_field(op, "reply");
+    json_t *reply = op_field(op, "reply");
     int             nproc = (int) op_i64(op, "nproc");
     struct aux_lock l;
 
@@ -994,8 +995,8 @@ op_nlm_cancel(
     json_t        *op,
     struct mism   *m)
 {
-    json_t         *reply = op_field(op, "reply");
-    int             msg   = op_bool(op, "msg");
+    json_t *reply = op_field(op, "reply");
+    int             msg = op_bool(op, "msg");
     struct aux_lock l;
 
     decode_lock(o, op_field(op, "lock"), &l);
@@ -1017,8 +1018,8 @@ op_nlm_unlock(
     json_t        *op,
     struct mism   *m)
 {
-    json_t         *reply = op_field(op, "reply");
-    int             msg   = op_bool(op, "msg");
+    json_t *reply = op_field(op, "reply");
+    int             msg = op_bool(op, "msg");
     struct aux_lock l;
 
     decode_lock(o, op_field(op, "lock"), &l);
@@ -1042,8 +1043,8 @@ op_nlm_granted(
     json_t        *op,
     struct mism   *m)
 {
-    json_t         *reply = op_field(op, "reply");
-    int             msg   = op_bool(op, "msg");
+    json_t *reply = op_field(op, "reply");
+    int             msg = op_bool(op, "msg");
     struct aux_lock l;
 
     decode_lock(o, op_field(op, "lock"), &l);
@@ -1089,12 +1090,12 @@ op_nlm_share(
     json_t        *op,
     struct mism   *m)
 {
-    json_t                *reply = op_field(op, "reply");
-    json_t                *sh    = op_field(op, "share");
+    json_t *reply = op_field(op, "reply");
+    json_t *sh    = op_field(op, "share");
     struct mbt_aux_result *r;
     uint8_t                oh[4];
     uint32_t               oh_len = oh_bytes(op_i64(sh, "oh"), oh);
-    json_t                *v;
+    json_t *v;
 
     r = mbt_nlm_share(o->env, op_bool(op, "unshare"),
                       caller_of(o, op_str(sh, "caller")),
@@ -1158,9 +1159,9 @@ op_sm_stat(
     json_t        *op,
     struct mism   *m)
 {
-    json_t                *reply = op_field(op, "reply");
+    json_t *reply = op_field(op, "reply");
     struct mbt_aux_result *r;
-    json_t                *v;
+    json_t *v;
 
     r = mbt_sm_stat(o->env, caller_of(o, op_str(op, "host")));
     if (!check_gate(o, reply, m)) {
@@ -1178,9 +1179,9 @@ op_sm_mon(
     json_t        *op,
     struct mism   *m)
 {
-    json_t                *reply = op_field(op, "reply");
+    json_t *reply = op_field(op, "reply");
     struct mbt_aux_result *r;
-    json_t                *v;
+    json_t *v;
 
     r = mbt_sm_mon(o->env, caller_of(o, op_str(op, "host")), "quintmbt",
                    100021, 4, 24);
@@ -1199,7 +1200,7 @@ op_sm_unmon(
     json_t        *op,
     struct mism   *m)
 {
-    json_t                *reply = op_field(op, "reply");
+    json_t *reply = op_field(op, "reply");
     struct mbt_aux_result *r;
 
     r = mbt_sm_unmon(o->env, caller_of(o, op_str(op, "host")), "quintmbt");
@@ -1215,7 +1216,7 @@ op_sm_unmon_all(
     json_t        *op,
     struct mism   *m)
 {
-    json_t                *reply = op_field(op, "reply");
+    json_t *reply = op_field(op, "reply");
     struct mbt_aux_result *r;
 
     r = mbt_sm_unmon_all(o->env, caller_of(o, op_str(op, "name")));
@@ -1488,7 +1489,7 @@ model_conflicts(
      * are compared in the POSIX convention the model stores: 0 (and the
      * model's -1 spelling) mean to-EOF. */
     for (i = 0; i < n; i++) {
-        json_t  *l = json_array_get(held, i);
+        json_t *l = json_array_get(held, i);
         int64_t  hlen;
         uint64_t hoff, hend, pend;
 
@@ -1513,9 +1514,10 @@ check_state(
     struct mism   *m)
 {
     static const uint8_t probe_oh[] = { 0xff, 0xff };
-    json_t              *held       = NULL;
+
+    json_t *held = NULL;
     const char          *k;
-    json_t              *v;
+    json_t *v;
     size_t               fi, oi, li;
 
     json_object_foreach(state, k, v)
@@ -1557,7 +1559,8 @@ static json_t *
 state_lastop(json_t *state)
 {
     const char *k;
-    json_t     *v;
+
+    json_t *v;
 
     json_object_foreach(state, k, v)
     {
@@ -1582,11 +1585,12 @@ run_trace(
     int             dry_run)
 {
     json_error_t   jerr;
-    json_t        *root;
-    json_t        *states;
-    json_t        *state;
-    json_t        *last_op;
-    json_t        *op;
+
+    json_t *root;
+    json_t *states;
+    json_t *state;
+    json_t *last_op;
+    json_t *op;
     const char    *tag;
     op_handler_t   fn;
     struct oracle *o;
@@ -1697,38 +1701,41 @@ main(
     char **argv)
 {
     static struct option long_options[] = {
-        { "trace",          required_argument,          0,
+        { "trace",          required_argument,            0,
           't'                                                                   },
-        { "trace-dir",      required_argument,          0,
+        { "trace-dir",      required_argument,            0,
           'D'                                                                                             },
-        { "exclude-prefix", required_argument,          0,
+        { "exclude-prefix", required_argument,            0,
           'X'                                                                                                                      },
-        { "dry-run",        no_argument,                0,
+        { "dry-run",        no_argument,                  0,
           'n'                                                                                                                                               },
-        { "verbose",        no_argument,                0,
+        { "verbose",        no_argument,                  0,
           'v'                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        },
-        { "paranoid",       no_argument,                0,
+        { "paranoid",       no_argument,                  0,
           'p'                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 },
-        { "backend",        required_argument,          0,
+        { "backend",        required_argument,            0,
           'B'                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          },
-        { "rdma",           no_argument,                0,
+        { "rdma",           no_argument,                  0,
           'R'                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          },
-        { 0,                0,                          0,                         0 },
+        { "sec",            required_argument,            0,
+          'S'                                                                           },
+        { 0,                0,                            0,                         0},
     };
     char               **traces;
-    int                  ntraces  = 0;
-    int                  dry_run  = 0;
-    int                  verbose  = 0;
-    const char          *backend  = "memfs";
-    int                  rdma     = 0;
-    int                  failures = 0;
+    int                  ntraces    = 0;
+    int                  dry_run    = 0;
+    int                  verbose    = 0;
+    const char          *backend    = "memfs";
+    int                  rdma       = 0;
+    int                  sec_flavor = MBT_SEC_SYS;
+    int                  failures   = 0;
     int                  c, i;
     struct mbt_env       env;
     struct mbt_env_opts  opts;
 
     traces = mbt_collect_traces(argc, argv, &ntraces);
 
-    while ((c = getopt_long(argc, argv, "t:D:X:nvpB:R", long_options,
+    while ((c = getopt_long(argc, argv, "t:D:X:nvpB:RS:", long_options,
                             NULL)) != -1) {
         switch (c) {
             case 't':
@@ -1750,6 +1757,18 @@ main(
             case 'R':
                 rdma = 1;
                 break;
+            case 'S': {
+                int sec = mbt_sec_parse(optarg);
+
+                if (sec < 0) {
+                    fprintf(stderr, "%s: unknown security flavor '%s'\n",
+                            argv[0], optarg);
+                    return 2;
+                }
+
+                sec_flavor = sec;
+                break;
+            }
             default:
                 fprintf(stderr,
                         "usage: %s [--trace FILE ...] [--trace-dir DIR] "
@@ -1770,6 +1789,7 @@ main(
 
     if (!dry_run) {
         memset(&opts, 0, sizeof(opts));
+        opts.sec    = sec_flavor;
         opts.module = backend;
         opts.rdma   = rdma;
         /* The universal addresses rpcbind reports are built from this rather

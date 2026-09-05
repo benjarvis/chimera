@@ -3933,7 +3933,9 @@ run_compound(
         o->arena_used = 0;
         o->env->nfs_v4.send_call_NFSPROC4_COMPOUND(&o->env->nfs_v4.rpc2,
                                                    o->env->evpl, conn,
-                                                   &o->env->cred, &args,
+                                                   mbt_cred_for(o->env, conn,
+                                                                &o->env->nfs_v4.rpc2),
+                                                   &args,
                                                    cd_ddp, cd_wchunk,
                                                    NULL, 0, 0,
                                                    v4_compound_cb, &cctx);
@@ -4230,7 +4232,9 @@ v4_send_raw(
     o->arena_used = 0;
     o->env->nfs_v4.send_call_NFSPROC4_COMPOUND(&o->env->nfs_v4.rpc2,
                                                o->env->evpl, conn,
-                                               &o->env->cred, &args,
+                                               mbt_cred_for(o->env, conn,
+                                                            &o->env->nfs_v4.rpc2),
+                                               &args,
                                                0, 0, NULL, 0, 0,
                                                v4_compound_cb, &cctx);
     while (!rep->done) {
@@ -4267,7 +4271,8 @@ v4_model_cs_seq(
     json_t *clients_map,
     int     client)
 {
-    size_t  i;
+    size_t i;
+
     json_t *pair;
 
     if (!clients_map) {
@@ -4287,11 +4292,11 @@ v4_close_dangling_opens(
     struct oracle *o,
     json_t        *final_state)
 {
-    json_t     *sdb = NULL;
-    json_t     *opens;
-    json_t     *oo40;
+    json_t *sdb = NULL;
+    json_t *opens;
+    json_t *oo40;
     const char *k;
-    json_t     *v;
+    json_t *v;
     int         client;
     uint32_t    oseq_next[V4_MAX_SIDS];   /* 4.0 open-owner -> next seqid */
     int         oi;
@@ -4325,7 +4330,7 @@ v4_close_dangling_opens(
         uint8_t           temp_sess[16] = { 0 };
         int               have_temp     = 0;
         size_t            i;
-        json_t           *pair;
+        json_t *pair;
 
         if (!o->clientid_known[client]) {
             continue;
@@ -4334,7 +4339,7 @@ v4_close_dangling_opens(
             /* Use the client's *live* session from the final state -- the trace
              * may have churned sessions, and the oracle keeps destroyed ones
              * mapped (a stale one would make SEQUENCE fail NFS4ERR_BADSESSION). */
-            size_t  si;
+            size_t si;
             json_t *spair;
 
             sess = -1;
@@ -4355,7 +4360,7 @@ v4_close_dangling_opens(
                 struct v4_reply crep;
                 int64_t         cs_seq;
                 size_t          oi3;
-                json_t         *op3;
+                json_t *op3;
                 int             has_opens = 0;
 
                 json_array_foreach(opens, oi3, op3)
@@ -4401,7 +4406,7 @@ v4_close_dangling_opens(
         } else {
             /* Seed this client's open-owner seqids: oo40's key is the
              * (client, owner) tuple and its record carries the last seqid. */
-            size_t  oi2;
+            size_t oi2;
             json_t *op40;
 
             for (oi = 0; oi < V4_MAX_SIDS; oi++) {
@@ -4426,7 +4431,7 @@ v4_close_dangling_opens(
 
         json_array_foreach(opens, i, pair)
         {
-            json_t              *rec = json_array_get(pair, 1);
+            json_t *rec = json_array_get(pair, 1);
             int64_t              sid = itf_i64(json_array_get(pair, 0));
             int64_t              file;
             int64_t              seq;
@@ -4529,11 +4534,11 @@ run_trace(
 {
     json_error_t   jerr;
 
-    json_t        *root;
-    json_t        *states;
-    json_t        *state;
-    json_t        *lastop;
-    json_t        *init;
+    json_t *root;
+    json_t *states;
+    json_t *state;
+    json_t *lastop;
+    json_t *init;
     struct oracle *o;
     size_t         nstates;
     size_t         idx;
@@ -4543,7 +4548,7 @@ run_trace(
     int            c;
     struct mism    m;
     const char    *k;
-    json_t        *jv;
+    json_t *jv;
 
     root = json_load_file(trace_path, 0, &jerr);
     if (!root) {
@@ -4724,6 +4729,25 @@ run_trace(
         v4_close_dangling_opens(o, json_array_get(states, sweep_idx));
     }
     v4_destroy_leftover_clients(o);
+    /* Retire every context first, then let the loop put the DESTROYs on the
+     * wire, and only then drop the connections underneath them.  Tearing a
+     * connection down with its own DESTROY still queued leaves the server
+     * holding a context nothing will ever retire. */
+    for (c = 0; c < V4_MAX_CLIENTS; c++) {
+        if (o->conns[c]) {
+            mbt_conn_release(env, o->conns[c]);
+        }
+    }
+
+    /* Only under a Kerberos flavor: AUTH_SYS queues nothing here, and its loop
+     * has no bounded wait, so a pump with nothing outstanding would park in
+     * the poller and never come back. */
+    if (env->sec != MBT_SEC_SYS) {
+        for (c = 0; c < 4; c++) {
+            evpl_continue(env->evpl);
+        }
+    }
+
     for (c = 0; c < V4_MAX_CLIENTS; c++) {
         if (o->conns[c]) {
             evpl_rpc2_client_disconnect(env->rpc2_thread, o->conns[c]);
@@ -4756,6 +4780,7 @@ main(
         { "pnfs",           required_argument, 0, 'p' },
         { "delegations",    no_argument,       0, 'g' },
         { "rdma",           no_argument,       0, 'R' },
+        { "sec",            required_argument, 0, 'S' },
         { "dry-run",        no_argument,       0, 'n' },
         { "verbose",        no_argument,       0, 'v' },
         { 0,                0,                 0, 0   },
@@ -4795,7 +4820,7 @@ main(
      * shared helper; getopt only recognizes them so it does not error. */
     traces = mbt_collect_traces(argc, argv, &ntraces);
 
-    while ((c = getopt_long(argc, argv, "t:D:X:M:b:p:gnvR", long_options,
+    while ((c = getopt_long(argc, argv, "t:D:X:M:b:p:gnvRS:", long_options,
                             NULL)) != -1) {
         switch (c) {
             case 't':
@@ -4838,6 +4863,18 @@ main(
             case 'R':
                 opts.rdma = 1;
                 break;
+            case 'S': {
+                int sec = mbt_sec_parse(optarg);
+
+                if (sec < 0) {
+                    fprintf(stderr, "%s: unknown security flavor '%s'\n",
+                            argv[0], optarg);
+                    return 2;
+                }
+
+                opts.sec = sec;
+                break;
+            }
             default:
                 fprintf(stderr,
                         "usage: %s [--trace FILE ...] [--trace-dir DIR] "
