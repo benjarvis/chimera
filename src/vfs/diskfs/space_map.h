@@ -412,6 +412,8 @@ struct sm_claim {
  * [cursor, base+len) thread-locally with no lock and no per-block allocator
  * call; refills via space_map_reserve_chunk when exhausted. */
 struct sm_reservation {
+    struct space_map *sm;           /* set at grant; lets a lock-free bump
+                                     * account itself against inflight_bytes */
     uint32_t         device_id;
     uint32_t         ag_index;
     uint64_t         base;
@@ -498,6 +500,19 @@ struct sm_device {
 };
 
 struct space_map {
+    /*
+     * Bytes handed to a caller by space_map_bump_alloc but not yet applied to
+     * the free tree.  The per-device free_bytes only moves when a redo retires
+     * (space_map_alloc_apply) or is abandoned (space_map_alloc_discard), so
+     * during a large allocation it reads high by everything still in flight.
+     * That lag is invisible to statfs, which is cold, but it is fatal to the
+     * reserve floor in space_map_reserve_chunk: the gate would keep seeing
+     * space that is already spoken for and let a data allocation walk straight
+     * through the reserve.  Maintained with two relaxed atomics on paths that
+     * already take one.
+     */
+    uint64_t          inflight_bytes;
+
     struct sm_device *devices;
     uint32_t          num_devices;
     uint32_t          device_rotor;
@@ -622,6 +637,7 @@ space_map_reserve_chunk(
     uint32_t               role,
     uint64_t               want,
     uint64_t               chunk,
+    uint64_t               reserve_floor,
     uint32_t               seed);
 
 /* Hand out `need` from `r` thread-locally (records the ALLOC delta).  Returns 0,
@@ -648,6 +664,7 @@ space_map_reservation_ensure(
     uint32_t               role,
     uint64_t               want,
     uint64_t               chunk,
+    uint64_t               reserve_floor,
     uint32_t               seed);
 
 /* Allocate `need` from `r`, refilling once if exhausted.  0 / -1. */
@@ -659,6 +676,7 @@ space_map_reservation_alloc(
     uint32_t                 role,
     uint64_t                 need,
     uint64_t                 chunk,
+    uint64_t                 reserve_floor,
     uint32_t                 seed,
     uint32_t                *r_device_id,
     uint64_t                *r_device_offset);

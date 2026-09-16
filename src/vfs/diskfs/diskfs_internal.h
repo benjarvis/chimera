@@ -4911,6 +4911,7 @@ diskfs_inode_alloc_async(
     DISKFS_SM_JNL(jnl, thread, txn, diskfs_inode_alloc_resume, actx);
     rc = space_map_reservation_alloc(shared->space_map, &thread->meta_resv, &jnl,
                                      SM_DEV_LOCAL, SM_BLOCK_SIZE, SM_RESERVATION_CHUNK,
+                                     /* reserve_floor */ 0,
                                      (uint32_t) ((uintptr_t) thread >> 7),
                                      &device_id, &device_offset);
     free(actx);
@@ -5006,6 +5007,11 @@ diskfs_kv_entry_alloc(
  * Must be called with the inode write-locked (the data path holds it).  Returns
  * SM_AGAIN on a journal-block miss (caller's resume re-drives), ENOSPC, or 0.
  */
+/* Defined below, next to diskfs_map_attrs, which reports the same figure. */
+static inline uint64_t
+diskfs_space_reserve_bytes(
+    const struct diskfs_shared *shared);
+
 static inline int
 diskfs_inode_alloc_space(
     struct diskfs_thread *thread,
@@ -5033,8 +5039,12 @@ diskfs_inode_alloc_space(
     (void) floor;       /* the reservation chunk handles small-write batching */
 
     DISKFS_SM_JNL(jnl, thread, txn, resume, resume_arg);
+    /* File data stops at the reserve; metadata (the other call site) passes 0
+     * and may spend it.  This is the enforcement half of what diskfs_map_attrs
+     * reports -- see the floor gate in space_map_reserve_chunk. */
     rc = space_map_reservation_alloc(sm, &thread->data_resv, &jnl,
                                      role, (uint64_t) desired_size, SM_RESERVATION_CHUNK,
+                                     diskfs_space_reserve_bytes(thread->shared),
                                      (uint32_t) ((uintptr_t) thread >> 7),
                                      &dev_id, r_device_offset);
     if (rc != 0) {

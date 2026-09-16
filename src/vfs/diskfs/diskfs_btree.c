@@ -1258,7 +1258,8 @@ diskfs_bt_run(struct diskfs_bt_op *op)
             (void) space_map_reservation_ensure(
                 thread->shared->space_map, &thread->meta_resv, SM_DEV_LOCAL,
                 (uint64_t) (DISKFS_BT_MAX_DEPTH + 2) * DISKFS_BLOCK_SIZE,
-                SM_RESERVATION_CHUNK, (uint32_t) ((uintptr_t) thread >> 7));
+                SM_RESERVATION_CHUNK,
+                /* reserve_floor */ 0, (uint32_t) ((uintptr_t) thread >> 7));
             op->phase = DISKFS_BT_PHASE_DESCEND;
             continue;
         }

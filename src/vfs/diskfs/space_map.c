@@ -1202,6 +1202,19 @@ space_map_alloc_apply(
     uint64_t          device_offset,
     uint64_t          length)
 {
+    /* Settle the in-flight count this range was added to at bump time; from
+     * here the free tree (apply) or the untouched tree (discard) is the whole
+     * truth again. */
+    {
+        uint64_t settle = SM_ALIGN_UP(length);
+
+        if (__atomic_load_n(&sm->inflight_bytes, __ATOMIC_RELAXED) >= settle) {
+            __atomic_sub_fetch(&sm->inflight_bytes, settle, __ATOMIC_RELAXED);
+        } else {
+            __atomic_store_n(&sm->inflight_bytes, 0, __ATOMIC_RELAXED);
+        }
+    }
+
     uint64_t      offset, aligned;
     struct sm_ag *ag;
 
@@ -1247,6 +1260,19 @@ space_map_alloc_discard(
     uint64_t          device_offset,
     uint64_t          length)
 {
+    /* Settle the in-flight count this range was added to at bump time; from
+     * here the free tree (apply) or the untouched tree (discard) is the whole
+     * truth again. */
+    {
+        uint64_t settle = SM_ALIGN_UP(length);
+
+        if (__atomic_load_n(&sm->inflight_bytes, __ATOMIC_RELAXED) >= settle) {
+            __atomic_sub_fetch(&sm->inflight_bytes, settle, __ATOMIC_RELAXED);
+        } else {
+            __atomic_store_n(&sm->inflight_bytes, 0, __ATOMIC_RELAXED);
+        }
+    }
+
     uint64_t         offset, aligned;
     struct sm_ag    *ag;
     struct sm_claim *c;
@@ -1508,6 +1534,7 @@ space_map_reserve_chunk(
     uint32_t               role,
     uint64_t               want,
     uint64_t               chunk,
+    uint64_t               reserve_floor,
     uint32_t               seed)
 {
     uint32_t start_dev, d;
@@ -1515,6 +1542,59 @@ space_map_reserve_chunk(
     want = SM_ALIGN_UP(want);
     if (chunk < want) {
         chunk = want;
+    }
+
+    /*
+     * Stop file data at the internal reserve.
+     *
+     * statfs subtracts the reserve from what it reports, so the report promises
+     * that once those bytes are spent the pool is full.  Subtracting it from
+     * the report alone does not keep that promise: the allocator would go on
+     * serving writes out of the reserve, and an application that believed
+     * statfs and wrote exactly what it offered would find the next write
+     * succeeding too.  nfstest_alloc checks both directions of that boundary --
+     * "allocate everything free" must succeed AND "now allocate a bit more"
+     * must fail -- so a reserve that is reported but not enforced simply moves
+     * the failure from the first assertion to the second.
+     *
+     * Metadata passes a floor of 0 and may spend the reserve; that is what it
+     * is for.  The b+tree records and log space a large allocation needs are
+     * exactly the demand the reserve exists to cover, and failing them for want
+     * of space the data path has already been denied would be the deadlock this
+     * is meant to avoid.
+     *
+     * Checked here rather than at each bump: this is the path that draws new
+     * space from the pool, and a thread's existing reservation was already
+     * counted as free by the same statfs number, so spending it is spending
+     * what was reported.  The granularity of the guarantee is therefore one
+     * reservation, not one block.
+     */
+    if (reserve_floor) {
+        uint64_t free_raw = space_map_free_bytes(sm);
+        uint64_t inflight = __atomic_load_n(&sm->inflight_bytes, __ATOMIC_RELAXED);
+        uint64_t free_now = free_raw > inflight ? free_raw - inflight : 0;
+        uint64_t headroom;
+
+        if (free_now < want || free_now - want < reserve_floor) {
+            return -1;      /* ENOSPC: what is left belongs to the reserve */
+        }
+
+        /*
+         * Cap the grant at the headroom too, not just the ask.  A reservation
+         * is handed out whole and then drawn down by bumps that never consult
+         * the allocator again, so a grant that reached past the floor would let
+         * the tail be spent straight through it -- the gate above would not be
+         * asked until the thread next needed a chunk, by which point the
+         * promise is already broken.  Bounding the grant keeps every byte a
+         * data reservation can serve inside the space statfs reported, which is
+         * what makes "spend exactly what was offered, then fail" hold on the
+         * block rather than on the reservation.
+         */
+        headroom = free_now - reserve_floor;
+
+        if (chunk > headroom) {
+            chunk = headroom;       /* >= want, checked above */
+        }
     }
 
     pthread_mutex_lock(&sm->lock);
@@ -1565,6 +1645,7 @@ space_map_reserve_chunk(
                     if (sm_ag_try_claim_locked(ag, want, chunk, &base, &len,
                                                &claim) == 0) {
                         pthread_mutex_unlock(&ag->lock);
+                        r->sm        = sm;
                         r->device_id = dev_id;
                         r->ag_index  = ai;
                         r->base      = base;
@@ -1606,6 +1687,7 @@ space_map_reserve_chunk(
             if (sm_ag_try_claim_locked(ag, want, chunk, &base, &len,
                                        &claim) == 0) {
                 pthread_mutex_unlock(&ag->lock);
+                r->sm        = sm;
                 r->device_id = dev_id;
                 r->ag_index  = ai;
                 r->base      = base;
@@ -1652,6 +1734,7 @@ space_map_reserve_chunk(
             if (sm_ag_try_claim_locked(ag, want, chunk, &base, &len,
                                        &claim) == 0) {
                 pthread_mutex_unlock(&ag->lock);
+                r->sm        = sm;
                 r->device_id = dev_id;
                 r->ag_index  = a;
                 r->base      = base;
@@ -1730,6 +1813,13 @@ space_map_bump_alloc(
     * release of this claim, so it never races the retiring flag. */
     __atomic_fetch_add(&r->claim->refcount, 1, __ATOMIC_RELAXED);
 
+    /* Count it as spent now.  The free tree will not know until this txn's
+     * redo retires, and the reserve floor cannot wait that long -- see
+     * space_map::inflight_bytes. */
+    if (r->sm) {
+        __atomic_add_fetch(&r->sm->inflight_bytes, need, __ATOMIC_RELAXED);
+    }
+
     /* ALLOC delta for crash recovery; applied to the in-memory tree only when
      * this txn's redo retires (space_map_alloc_apply), never eagerly -- so the
      * tree stays == committed state and condense can't leak the tail. */
@@ -1787,6 +1877,7 @@ space_map_reservation_ensure(
     uint32_t               role,
     uint64_t               want,
     uint64_t               chunk,
+    uint64_t               reserve_floor,
     uint32_t               seed)
 {
     want = SM_ALIGN_UP(want);
@@ -1802,7 +1893,7 @@ space_map_reservation_ensure(
         }
     }
     space_map_release_reservation(sm, r);       /* retire the old claim (if any) */
-    return space_map_reserve_chunk(sm, r, role, want, chunk, seed);
+    return space_map_reserve_chunk(sm, r, role, want, chunk, reserve_floor, seed);
 } /* space_map_reservation_ensure */
 
 /*
@@ -1818,6 +1909,7 @@ space_map_reservation_alloc(
     uint32_t                 role,
     uint64_t                 need,
     uint64_t                 chunk,
+    uint64_t                 reserve_floor,
     uint32_t                 seed,
     uint32_t                *r_device_id,
     uint64_t                *r_device_offset)
@@ -1855,7 +1947,8 @@ space_map_reservation_alloc(
 
         /* Exhausted, or recalled out from under us: retire the old claim and
          * grab a fresh chunk. */
-        if (space_map_reservation_ensure(sm, r, role, need, chunk, seed) != 0) {
+        if (space_map_reservation_ensure(sm, r, role, need, chunk,
+                                         reserve_floor, seed) != 0) {
             return -1;      /* genuinely out of space */
         }
     }

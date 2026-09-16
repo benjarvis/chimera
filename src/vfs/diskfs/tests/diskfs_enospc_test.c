@@ -95,6 +95,51 @@ main(
     assert(r == 0);
     printf("free after boundary allocate: %" PRIu64 "\n", sp.ag_free_sum);
 
+    /*
+     * alloc06's other half, which this test used to omit -- and omitting it is
+     * how the reserve shipped enforced in one direction only.
+     *
+     * Having taken every byte statfs offered, the NEXT allocation must fail.
+     * That is the contract the reported number makes: space_avail is what a
+     * writer can place, so once it is spent the allocator owes ENOSPC.  A
+     * reserve that is subtracted from the report but still handed out by the
+     * allocator breaks it in the opposite direction from the shortfall above --
+     * the pool keeps serving writes after claiming to be full, which is what
+     * nfstest_alloc's "Allocate should fail with ENOSPC when whole range cannot
+     * be guaranteed, but it succeeded" says.
+     */
+    {
+        struct chimera_vfs_open_handle *over_h;
+        uint64_t                        reported_left, over_ask;
+        int                             over;
+
+        /* Let the boundary allocation's ALLOC deltas retire before reading the
+         * free total.  They are applied to the free tree when their redo
+         * retires, not when the allocate returns, so a snapshot taken straight
+         * away still reports the space this file just took -- and the
+         * over-commit below would then ask for a number that is trivially too
+         * large and "pass" for the wrong reason. */
+        diskfs_test_await_reclaim(dh.vfs, dh.evpl, 30000);
+
+        r = diskfs_test_space(dh.vfs, &sp);
+        assert(r == 0);
+
+        reported_left = sp.ag_free_sum > sp.reserve_bytes
+            ? sp.ag_free_sum - sp.reserve_bytes : 0;
+        over_ask = reported_left + ENOSPC_SMALL;
+
+        r = dh_create(&dh, root, "over", fh, &fhlen, &over_h);
+        assert(r == CHIMERA_VFS_OK);
+        over = dh_allocate(&dh, over_h, 0, over_ask, 0);
+        printf("over-commit allocate of %" PRIu64 " bytes: %d (reported_left=%"
+               PRIu64 ", want ENOSPC=%d)\n",
+               over_ask, over, reported_left, CHIMERA_VFS_ENOSPC);
+        dh_release(&dh, over_h);
+        assert(dh_remove(&dh, root, "over") == CHIMERA_VFS_OK);
+        CHECK(&dh);
+        assert(over == CHIMERA_VFS_ENOSPC);
+    }
+
     /* A failed allocate must leave the file exactly as it found it.  The
      * allocator hands blocks out of a per-thread reservation and marks them
      * used only when the transaction's redo retires, so a transaction that
