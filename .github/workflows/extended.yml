@@ -45,7 +45,7 @@ jobs:
                 --output-junit /workspace/validation-logs/wpts.xml
               ctest -C extended --no-tests=error --output-on-failure \
                 --test-output-size-failed 10485760 \
-                -R "^chimera/server/smb/smbtorture_smb2_(lease|oplock|replay)_memfs$" \
+                -R "^chimera/server/smb/smbtorture_smb2_(lease|oplock|replay)(_.*)?_memfs$" \
                 --output-junit /workspace/validation-logs/smbtorture.xml
               for source in src/vfs/vfs_claim.c src/vfs/vfs_claim_break.c; do
                 git -C /workspace show 7131ac64:"$source" > /workspace/"$source"
