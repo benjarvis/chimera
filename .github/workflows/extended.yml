@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-          fetch-depth: 3
+          fetch-depth: 0
       - name: Build and exercise SMB leases
         env:
           BUILD_TYPE: ${{ matrix.build_type }}
